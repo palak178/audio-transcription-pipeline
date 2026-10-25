@@ -1,11 +1,19 @@
 # Audio Transcription Service
 
-Audio in, timestamped text out — as a CLI and as an HTTP API.
+An audio transcription pipeline that converts speech in any ffmpeg-readable audio file into
+text, with a timestamp for every segment — available as a CLI and as an HTTP API.
 
-Built for the Volga Partners AI Engineer assessment. **Part 1 is implemented and tested;
-Part 2 is a design document** ([DESIGN.md](docs/DESIGN.md)), because the brief asks for thoughts
-rather than code there. That split is deliberate, and the section
-[What is deliberately not built](#what-is-deliberately-not-built) says exactly where the line
+Formats are detected from content rather than the filename, long recordings are transcribed in
+silence-aligned windows so peak memory tracks the window size rather than the length of the
+audio, and results come back as JSON, SRT, WebVTT or plain text. It runs fully offline on CPU
+with [faster-whisper](https://github.com/SYSTRAN/faster-whisper) — no API key, and the audio
+never leaves the host.
+
+**Scope.** Part 1 — the pipeline — is implemented and tested. Part 2 — the production
+architecture it would need at scale, covering concurrent uploads, durable storage, retry and
+recovery, and an asynchronous job API — is design only, written up in
+[DESIGN.md](docs/DESIGN.md) rather than built.
+[What is deliberately not built](#what-is-deliberately-not-built) says exactly where that line
 falls and why.
 
 ## Quick start
@@ -61,7 +69,7 @@ This recording is a test fixture for the audio transcription service.
 
 ## Where each requirement is answered
 
-| Requirement from the brief | Implemented in | Covered by |
+| Requirement | Implemented in | Covered by |
 |---|---|---|
 | Accepts an audio file (e.g. WAV or MP3) | `cli.py`, `api.py`, `audio.inspect` | `test_audio.py`, `test_api.py` |
 | Transcribes spoken language into text | `transcriber.py` | `test_integration.py` |
@@ -101,7 +109,7 @@ The pipeline is five stages:
 
 ---
 
-## Part 1
+## Part 1 — The pipeline
 
 ### Accepting an audio file
 
@@ -179,8 +187,8 @@ Every segment carries `start`, `end`, `duration`, `text`, plus `confidence`, `av
 Two details worth knowing. Whisper's segment timestamps are derived from decoder token
 positions and drift by a few hundred milliseconds; `--word-timestamps` runs a DTW alignment
 over the model's cross-attention, which tightens both word *and* segment edges for about
-10-25% more compute. It is off by default because the brief asks for segment timestamps, and
-the cost should be opt-in.
+10-25% more compute. It is off by default because segment timestamps are what most
+consumers need, so the extra cost should be opt-in.
 
 `confidence` is `exp(avg_logprob)` — the geometric mean of the per-token probabilities,
 restated as a readable 0-1 value. It is deliberately **not** billed as a calibrated
@@ -324,7 +332,7 @@ matter how neatly memory is bounded. That is what [DESIGN.md](docs/DESIGN.md) ad
 
 ## Output contract
 
-The JSON is the "processed for downstream use" part of the brief — designed to be depended on:
+The JSON is the contract for downstream consumers — designed to be depended on:
 
 ```json
 {
@@ -395,7 +403,7 @@ per window on gapless audio, against not being OOM-killed.
 
 ### 5. A synchronous API with a documented limit
 Transcription takes minutes, so a long blocking HTTP request is the wrong shape. Fixing that
-*properly* needs durable job state, retries and a worker tier — all Part 2 topics. Rather than
+*properly* needs durable job state, retries and a worker tier — all production concerns. Rather than
 half-build a job system, the endpoint transcribes inline and **refuses audio over
 `max_sync_duration_seconds` (default 600 s) with a `413` that names the limit and points at the
 CLI**:
@@ -523,22 +531,22 @@ recording used by the integration tests.
 
 ## What is deliberately not built
 
-The brief states that Part 2 needs no implementation, so these are design, not code:
+These are deliberately design rather than code, and DESIGN.md covers each one:
 
 | Not built | Why |
 |---|---|
-| Job queue, worker tier, Redis/SQS | Part 2 — "concurrent uploads", "retry or recover" |
-| Postgres / S3 / durable job state | Part 2 — "store audio and transcripts" |
-| Retries, leases, dead-letter queue | Part 2 — the *classification* that drives policy is in `errors.py` (`code`, `retryable`) |
-| Asynchronous job API, webhooks | Part 2 — "expose this as an API" |
-| Auth, quotas, rate limits, metrics | Not requested; designed in docs/DESIGN.md |
-| Speaker diarisation | Not requested. `pyannote` adds a gated model and real latency; a shaky implementation would be worse than a clear omission |
+| Job queue, worker tier, Redis/SQS | Production concurrency and recovery — designed, not built |
+| Postgres / S3 / durable job state | Audio and transcript storage — designed, not built |
+| Retries, leases, dead-letter queue | Designed, not built — though the *classification* that drives the policy is in `errors.py` (`code`, `retryable`) |
+| Asynchronous job API, webhooks | Designed, not built — the implemented API is synchronous and capped |
+| Auth, quotas, rate limits, metrics | Out of scope here; designed in docs/DESIGN.md |
+| Speaker diarisation | Out of scope. `pyannote` adds a gated model and real latency; a shaky implementation would be worse than a clear omission |
 | Parallel transcription of windows | Windows contend for the same cores, and CTranslate2 already parallelises a single request across them. Parallelism belongs *across* files, in the worker pool |
 | Streaming / live transcription | A genuinely different problem (partial hypotheses, revision) and out of scope |
 
-I did implement two things that touch Part 2 territory, because the pipeline needs them to be
-correct rather than to demonstrate anything: the in-process concurrency semaphore, and the
-content hash. Both are called out above.
+Two things on that list are partly present, because the pipeline needs them to be correct
+rather than to demonstrate anything: the in-process concurrency semaphore, and the content
+hash. Both are called out above.
 
 ---
 
@@ -607,12 +615,12 @@ src/transcription/
   cli.py           transcribe / inspect / warm
   api.py           POST /v1/transcriptions, GET /healthz
 docs/
-  DESIGN.md        Part 2 — production design (design only, nothing implemented)
+  DESIGN.md        production architecture (design only, nothing implemented)
   RUNNING.md       step-by-step setup, every command to try, troubleshooting
 tests/             130 fast + 10 slow
 scripts/           make_fixtures.sh
 samples/           one committed 43 KB recording
-README.md          this file — architecture, decisions, Part 1 answers
+README.md          this file — architecture and design decisions
 ```
 
 ---

@@ -2,7 +2,7 @@
 #
 # Generate the test-fixture audio set.
 #
-# The brief allows mock data. Only one real recording is committed to git
+# Only one real recording is committed to git
 # (samples/speech_en.mp3, ~43 KB of synthesised English speech); every other fixture is
 # derived from it here. That keeps the repository small while still giving the test suite a
 # genuine multi-format matrix and the awkward inputs that break naive implementations.

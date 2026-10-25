@@ -1,8 +1,9 @@
-# Part 2 — System Design
+# Part 2 — Production System Design
 
-> The brief asks for thoughts rather than code here, so nothing in this document is
-> implemented. Where the repository already contains a seam that the production design would
-> plug into, I point at the file. The boundary is deliberate and is discussed in
+> **Nothing in this document is implemented.** It describes the architecture this pipeline would
+> need to run as a real service, and it is deliberately design rather than code. Where the
+> repository already contains a seam the production design would plug into, I point at the file.
+> The boundary is discussed in
 > [README.md](../README.md#what-is-deliberately-not-built).
 
 The single idea the rest of this document follows from:

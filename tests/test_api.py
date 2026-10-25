@@ -332,7 +332,7 @@ def test_concurrent_uploads_all_succeed(client: TestClient, make_audio) -> None:
     """More simultaneous requests than the semaphore allows: they queue, none fail.
 
     This only proves the in-process admission control is sound. Scaling concurrency properly
-    is a Part 2 topic — see docs/DESIGN.md.
+    needs the worker pool described in docs/DESIGN.md.
     """
     source = make_audio("clip.wav", extra=["-c:a", "pcm_s16le"])
     payload = source.read_bytes()

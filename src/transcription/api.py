@@ -4,8 +4,8 @@ Deliberately synchronous, with a documented duration limit.
 
 Transcription takes minutes, which makes a blocking HTTP request the wrong shape for long
 audio. The correct fix is an asynchronous job API, and that requires durable job state,
-retries and a worker tier — all of which are Part 2 of the brief, which asks for design
-rather than implementation. So rather than half-build a job system, this endpoint:
+retries and a worker tier — production infrastructure that is designed in docs/DESIGN.md
+rather than built here. So rather than half-build a job system, this endpoint:
 
 * transcribes inline and returns the full result, which is the right behaviour for the short
   clips an interactive caller actually sends;

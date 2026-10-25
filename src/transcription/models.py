@@ -1,7 +1,7 @@
 """The output contract.
 
-These models *are* the "processed for downstream use" part of the brief. A consumer should be
-able to depend on this shape, so the result carries:
+These models *are* the contract for downstream consumers. A consumer should be able to depend
+on this shape, so the result carries:
 
 * ``schema_version`` — so the format can evolve without breaking existing consumers;
 * ``id`` — the SHA-256 of the source bytes, which makes the same audio produce the same
