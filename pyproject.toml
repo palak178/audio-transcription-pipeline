@@ -1,0 +1,56 @@
+[project]
+name = "audio-transcription-service"
+version = "0.1.0"
+description = "Audio transcription pipeline: audio in, timestamped segments out."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "faster-whisper>=1.1.0",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "python-multipart>=0.0.12",
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.6.0",
+    "typer>=0.15.0",
+    # Imported directly by audio.py. It arrives transitively via faster-whisper, but a direct
+    # import deserves a direct declaration.
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "httpx>=0.27.0",
+    "ruff>=0.8.0",
+]
+
+[project.scripts]
+transcribe = "transcription.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/transcription"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The default run excludes `slow`, so `pytest` needs no model weights and finishes in
+# about a second. `make test-all` includes them.
+addopts = "-q --strict-markers -m 'not slow'"
+markers = [
+    "slow: requires ffmpeg-generated fixtures and a real Whisper model download",
+]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+# B008 flags function calls in argument defaults. `File(...)` and `Form(...)` in defaults is
+# the documented FastAPI idiom for declaring multipart parameters, not a mistake.
+"src/transcription/api.py" = ["B008"]

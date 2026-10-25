@@ -1,0 +1,27 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.env
+out/
+models/
+
+# Editor and OS cruft. None of it is present now; these lines keep it from appearing
+# in a commit after someone opens the folder in Finder or an IDE.
+.DS_Store
+.idea/
+.vscode/
+*.swp
+.coverage
+htmlcov/
+
+# Generated fixtures. Only samples/speech_en.mp3 is committed; the rest are
+# derived from it by scripts/make_fixtures.sh and must not be in git.
+samples/generated/
+
+# Scratch space: local notes and throwaway tooling, nothing the project needs to build or run.
+.local/
