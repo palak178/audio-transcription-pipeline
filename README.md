@@ -1,5 +1,10 @@
 # Audio Transcription Service
 
+[![CI](https://github.com/palak178/audio-transcription-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/palak178/audio-transcription-pipeline/actions/workflows/ci.yml)
+[![Integration](https://github.com/palak178/audio-transcription-pipeline/actions/workflows/integration.yml/badge.svg)](https://github.com/palak178/audio-transcription-pipeline/actions/workflows/integration.yml)
+[![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue)](pyproject.toml)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 An audio transcription pipeline that converts speech in any ffmpeg-readable audio file into
 text, with a timestamp for every segment — available as a CLI and as an HTTP API.
 
@@ -9,12 +14,12 @@ audio, and results come back as JSON, SRT, WebVTT or plain text. It runs fully o
 with [faster-whisper](https://github.com/SYSTRAN/faster-whisper) — no API key, and the audio
 never leaves the host.
 
-**Scope.** Part 1 — the pipeline — is implemented and tested. Part 2 — the production
-architecture it would need at scale, covering concurrent uploads, durable storage, retry and
-recovery, and an asynchronous job API — is design only, written up in
-[DESIGN.md](docs/DESIGN.md) rather than built.
+**Scope, stated up front.** The pipeline is built and tested. The production architecture it
+would need at scale — concurrent uploads, durable storage, retry and recovery, an asynchronous
+job API — is written up as design in [DESIGN.md](docs/DESIGN.md) rather than half-built.
 [What is deliberately not built](#what-is-deliberately-not-built) says exactly where that line
-falls and why.
+falls and why, feature by feature. Drawing it explicitly is the point: a scope boundary you can
+see is worth more than one you have to discover.
 
 ## Quick start
 
@@ -67,9 +72,9 @@ This recording is a test fixture for the audio transcription service.
 
 ---
 
-## Where each requirement is answered
+## What is built, and where to look
 
-| Requirement | Implemented in | Covered by |
+| Capability | Implemented in | Tested by |
 |---|---|---|
 | Accepts an audio file (e.g. WAV or MP3) | `cli.py`, `api.py`, `audio.inspect` | `test_audio.py`, `test_api.py` |
 | Transcribes spoken language into text | `transcriber.py` | `test_integration.py` |
@@ -109,7 +114,7 @@ The pipeline is five stages:
 
 ---
 
-## Part 1 — The pipeline
+## The pipeline
 
 ### Accepting an audio file
 

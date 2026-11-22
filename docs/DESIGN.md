@@ -1,4 +1,4 @@
-# Part 2 — Production System Design
+# Production System Design
 
 > **Almost nothing in this document is implemented.** It describes the architecture this
 > pipeline would need to run as a real service, and it is deliberately design rather than code.

@@ -1,0 +1,49 @@
+name: CI
+
+# Fast feedback only: lint and the suite that needs no model weights. Kept separate from
+# integration.yml deliberately — this job is cheap, deterministic and has no network
+# dependency beyond pip, so it is the one worth gating on and the one the badge points at.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Lint + tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      # ffmpeg is the entire format-handling layer here, not an optional extra, so it is
+      # installed rather than stubbed: the fast suite runs real ffmpeg and ffprobe
+      # subprocesses and generates its own audio fixtures with them.
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          ffmpeg -version | head -1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: python -m pip install -e ".[dev]"
+
+      - name: Lint
+        run: python -m ruff check src tests
+
+      - name: Tests
+        run: python -m pytest -q

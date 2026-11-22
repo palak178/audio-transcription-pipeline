@@ -4,6 +4,18 @@ version = "0.1.0"
 description = "Audio transcription pipeline: audio in, timestamped segments out."
 readme = "README.md"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Palak Namdev" }]
+keywords = ["transcription", "whisper", "speech-to-text", "asr", "audio"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "faster-whisper>=1.1.0",
     "fastapi>=0.115.0",
