@@ -31,11 +31,11 @@ from pathlib import Path
 from typing import Annotated
 
 import anyio
-from fastapi import APIRouter, File, Form, Header, Query, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Header, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
 from transcription import audio as audio_module
-from transcription import blobstore, exporters, jobstore
+from transcription import auth, blobstore, exporters, jobstore
 from transcription.config import Settings
 from transcription.errors import TranscriptionError
 from transcription.exporters import ResponseFormat
@@ -50,10 +50,10 @@ from transcription.pipeline import safe_filename
 
 logger = logging.getLogger(__name__)
 
-# Until per-tenant API keys exist, every unattributed request belongs to this tenant. A fixed
-# UUID rather than a random one per process, so jobs submitted before a restart are still
-# visible after it.
-ANONYMOUS_TENANT = uuid.UUID("00000000-0000-0000-0000-000000000001")
+# Re-exported so existing imports keep working. The tenant a request belongs to is now decided
+# by auth.resolve_tenant, which prefers a presented API key and ignores the header entirely
+# once one is given.
+ANONYMOUS_TENANT = auth.ANONYMOUS_TENANT
 
 
 class JobNotFoundError(TranscriptionError):
@@ -72,13 +72,23 @@ class TranscriptNotReadyError(TranscriptionError):
     http_status = 409
 
 
-def _tenant_from(header: str | None) -> uuid.UUID:
-    if not header:
-        return ANONYMOUS_TENANT
-    try:
-        return uuid.UUID(header)
-    except ValueError as exc:
-        raise TranscriptionError(f"X-Tenant-Id must be a UUID, got {header!r}") from exc
+def tenant_dependency(
+    request: Request,
+    authorization: Annotated[str | None, Header(alias="Authorization")] = None,
+    tenant: Annotated[str | None, Header(alias="X-Tenant-Id")] = None,
+) -> uuid.UUID:
+    """Resolve the caller's tenant for every job endpoint.
+
+    A dependency rather than a line in each handler, because this is the check that must not
+    be forgotten when a seventh endpoint is added. Declaring it once means a new route cannot
+    accidentally ship unscoped.
+    """
+    return auth.resolve_tenant(
+        request.app.state.settings, authorization=authorization, tenant_header=tenant
+    )
+
+
+Tenant = Annotated[uuid.UUID, Depends(tenant_dependency)]
 
 
 def to_resource(job: jobstore.Job) -> JobResource:
@@ -147,10 +157,9 @@ def create_jobs_router(settings: Settings) -> APIRouter:
         word_timestamps: Annotated[bool, Form(description="Add per-word timings.")] = False,
         diarise: Annotated[bool, Form(description="Label who spoke.")] = False,
         idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
-        tenant: Annotated[str | None, Header(alias="X-Tenant-Id")] = None,
+        tenant_id: Tenant = None,  # type: ignore[assignment]
     ) -> Response:
         current: Settings = request.app.state.settings
-        tenant_id = _tenant_from(tenant)
 
         with tempfile.TemporaryDirectory(prefix="submit-") as tmp_dir:
             staged = Path(tmp_dir) / "upload"
@@ -197,10 +206,9 @@ def create_jobs_router(settings: Settings) -> APIRouter:
     async def get_job(
         request: Request,
         job_id: uuid.UUID,
-        tenant: Annotated[str | None, Header(alias="X-Tenant-Id")] = None,
+        tenant_id: Tenant = None,  # type: ignore[assignment]
     ) -> JobResource:
         current: Settings = request.app.state.settings
-        tenant_id = _tenant_from(tenant)
         job = await anyio.to_thread.run_sync(
             lambda: jobstore.get(current, job_id=job_id, tenant_id=tenant_id)
         )
@@ -232,10 +240,9 @@ def create_jobs_router(settings: Settings) -> APIRouter:
                 )
             ),
         ] = True,
-        tenant: Annotated[str | None, Header(alias="X-Tenant-Id")] = None,
+        tenant_id: Tenant = None,  # type: ignore[assignment]
     ) -> Response:
         current: Settings = request.app.state.settings
-        tenant_id = _tenant_from(tenant)
 
         def load() -> tuple[jobstore.Job | None, dict | None]:
             found = jobstore.get(current, job_id=job_id, tenant_id=tenant_id)
@@ -274,10 +281,9 @@ def create_jobs_router(settings: Settings) -> APIRouter:
         status: Annotated[str | None, Query(description="Filter by status.")] = None,
         cursor: Annotated[str | None, Query(description="From a previous page.")] = None,
         limit: Annotated[int, Query(ge=1, le=200)] = 50,
-        tenant: Annotated[str | None, Header(alias="X-Tenant-Id")] = None,
+        tenant_id: Tenant = None,  # type: ignore[assignment]
     ) -> JobList:
         current: Settings = request.app.state.settings
-        tenant_id = _tenant_from(tenant)
 
         if status is not None and status not in {
             "queued",
@@ -313,10 +319,9 @@ def create_jobs_router(settings: Settings) -> APIRouter:
     async def delete_job(
         request: Request,
         job_id: uuid.UUID,
-        tenant: Annotated[str | None, Header(alias="X-Tenant-Id")] = None,
+        tenant_id: Tenant = None,  # type: ignore[assignment]
     ) -> Response:
         current: Settings = request.app.state.settings
-        tenant_id = _tenant_from(tenant)
 
         def erase() -> jobstore.Job | None:
             removed = jobstore.delete_job(current, job_id=job_id, tenant_id=tenant_id)

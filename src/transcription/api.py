@@ -190,7 +190,7 @@ def create_app(
         # endpoint does not. Mounted here rather than at import time so that the settings
         # actually in force decide, and so a test can build either shape of app.
         if resolved_settings.jobs_enabled:
-            from transcription import db
+            from transcription import auth, db
             from transcription.api_jobs import create_jobs_router
 
             # Migrating on startup means a deployment needs no separate step to be correct.
@@ -199,6 +199,7 @@ def create_app(
             applied = await anyio.to_thread.run_sync(partial(db.migrate, resolved_settings))
             if applied:
                 logger.info("applied migrations: %s", ", ".join(applied))
+            auth.warn_if_unauthenticated(resolved_settings)
             app.include_router(create_jobs_router(resolved_settings))
             # FastAPI caches the generated schema, so it has to be dropped after a late mount
             # or /docs would show the app as it was before the router arrived.
@@ -285,7 +286,16 @@ def create_app(
             logger.exception("request failed: %s %s %s", exc.code, exc.message, exc.details)
         else:
             logger.info("rejected request: %s %s %s", exc.code, exc.message, exc.details)
-        return JSONResponse(status_code=exc.http_status, content=exc.to_dict())
+        # RFC 9110 requires WWW-Authenticate on a 401, and it is what tells a client which
+        # scheme to use rather than leaving it to guess.
+        headers = (
+            {"WWW-Authenticate": 'Bearer realm="transcription"'}
+            if exc.http_status == 401
+            else None
+        )
+        return JSONResponse(
+            status_code=exc.http_status, content=exc.to_dict(), headers=headers
+        )
 
     @app.exception_handler(RequestValidationError)
     async def handle_validation_error(_: Request, exc: RequestValidationError) -> JSONResponse:

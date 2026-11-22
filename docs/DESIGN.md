@@ -11,7 +11,8 @@
 > | Retry and recovery | **Built** — `jobstore.py`, `checkpoint.py`, `worker.py` |
 > | Speaker diarisation | **Built except the model backend** — `diarisation.py` |
 > | Exposing this as an API | **Built** — `api_jobs.py`, at `/v1/jobs` |
-> | Auth, quotas, webhooks | Design |
+> | Auth | **Built** — `auth.py`, per-tenant API keys |
+> | Quotas, rate limits, webhooks | Design |
 >
 > Three places where building it corrected the design, each marked in context below: the queue
 > is Postgres rather than SQS, idempotency needed more than `(tenant, audio, model)`, and
@@ -703,8 +704,10 @@ Were this to become the real service, in order:
 3. ~~Retry policy, lease heartbeats and a dead-letter queue.~~ **Done** — permanent/transient
    classification, leases with heartbeats, jittered exponential backoff, dead-lettering, and
    lease reclaim for workers that die. Alerting is still design.
-4. Webhooks, then per-tenant auth and quotas. **Still design.** The tenant column and scoping
-   exist; the authentication that would populate it does not.
+4. ~~Per-tenant auth.~~ **Done** — `auth.py`: hashed, revocable API keys, with the tenant
+   header ignored once a key is presented so it cannot be used as a bypass. Webhooks and
+   quotas are still design, but authentication is the part that had to come first, since
+   there is nothing to meter without it.
 5. ~~Window-level checkpointing.~~ **Done** — `checkpoint.py`. A retry re-reads the WAV but
    skips inference on windows a previous attempt finished, guarded by a plan fingerprint so
    changed settings discard the checkpoints rather than stitching a wrong transcript.

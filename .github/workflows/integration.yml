@@ -67,3 +67,54 @@ jobs:
             -v "$PWD/samples:/data:ro" \
             audio-transcription-service \
             transcribe /data/speech_en.mp3 --format srt
+
+  # Proves `docker compose up` actually produces a working service: Postgres, the API and a
+  # worker, with the API and worker sharing a blob volume. That sharing is the thing most
+  # likely to be broken silently — give each container its own copy of the blob directory and
+  # every job fails with blob_not_found, which no unit test would catch.
+  compose:
+    name: docker compose end to end
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Start the stack
+        run: docker compose up --build --detach --wait --wait-timeout 600
+
+      - name: Submit a job and wait for the transcript
+        run: |
+          set -euo pipefail
+
+          id=$(curl -sf -F file=@samples/speech_en.mp3 http://localhost:8000/v1/jobs \
+               | python -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+          echo "submitted job $id"
+
+          for attempt in $(seq 1 60); do
+            status=$(curl -sf "http://localhost:8000/v1/jobs/$id" \
+                     | python -c 'import json,sys; print(json.load(sys.stdin)["status"])')
+            echo "  attempt $attempt: $status"
+            case "$status" in
+              succeeded) break ;;
+              failed|dead_letter)
+                echo "::error::job ended as $status"
+                curl -s "http://localhost:8000/v1/jobs/$id" | python -m json.tool
+                exit 1 ;;
+            esac
+            sleep 5
+          done
+
+          if [ "$status" != "succeeded" ]; then
+            echo "::error::job never finished (last status: $status)"
+            exit 1
+          fi
+
+          echo "--- transcript (srt) ---"
+          curl -sf "http://localhost:8000/v1/jobs/$id/transcript?format=srt"
+
+      - name: Logs on failure
+        if: failure()
+        run: docker compose logs --no-color --tail 200
+
+      - name: Tear down
+        if: always()
+        run: docker compose down --volumes

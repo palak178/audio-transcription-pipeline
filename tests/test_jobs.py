@@ -793,3 +793,192 @@ def test_checkpoints_are_cleared_once_the_job_succeeds(
             "SELECT count(*) FROM job_checkpoints WHERE job_id = %s", (job.id,)
         ).fetchone()[0]
     assert remaining == 0
+
+
+# --- Authentication -----------------------------------------------------------------------
+
+
+@pytest.fixture
+def authed_settings(job_settings):
+    return job_settings.model_copy(update={"auth_required": True})
+
+
+@pytest.fixture
+def authed_client(authed_settings):
+    app = create_app(settings=authed_settings, transcriber=FakeTranscriber())
+    with TestClient(app) as client:
+        yield client
+
+
+def test_a_key_is_shown_once_and_stored_only_as_a_digest(job_settings, tenant) -> None:
+    """A database dump must not hand over working credentials."""
+    from transcription import auth
+
+    plaintext, record = auth.create_api_key(job_settings, tenant_id=tenant, name="ci")
+
+    assert plaintext.startswith("atk_")
+    assert record.tenant_id == tenant
+    assert record.is_active
+
+    with db.transaction(job_settings) as conn:
+        stored = conn.execute(
+            "SELECT key_hash, key_prefix FROM api_keys WHERE id = %s", (record.id,)
+        ).fetchone()
+
+    assert stored[0] != plaintext, "the secret must not be stored in plaintext"
+    assert plaintext not in stored[0]
+    # The prefix is deliberately open, so a key is identifiable in a log without being usable.
+    assert plaintext.startswith(stored[1])
+
+
+def test_verify_accepts_a_good_key_and_refuses_everything_else(job_settings, tenant) -> None:
+    from transcription import auth
+
+    plaintext, record = auth.create_api_key(job_settings, tenant_id=tenant, name="ci")
+
+    assert auth.verify(job_settings, plaintext).tenant_id == tenant
+
+    for bad in ("", "nonsense", "atk_wrong", plaintext + "x", plaintext[:-1]):
+        with pytest.raises(auth.AuthenticationError):
+            auth.verify(job_settings, bad)
+
+    assert auth.revoke(job_settings, key_id=record.id) is True
+    with pytest.raises(auth.AuthenticationError):
+        auth.verify(job_settings, plaintext)
+    # Revoking twice is not an error, but reports that nothing changed.
+    assert auth.revoke(job_settings, key_id=record.id) is False
+
+
+def test_a_revoked_key_is_indistinguishable_from_an_unknown_one(job_settings, tenant) -> None:
+    """Otherwise the error message is an oracle for which keys exist."""
+    from transcription import auth
+
+    plaintext, record = auth.create_api_key(job_settings, tenant_id=tenant, name="ci")
+    auth.revoke(job_settings, key_id=record.id)
+
+    with pytest.raises(auth.AuthenticationError) as revoked:
+        auth.verify(job_settings, plaintext)
+    with pytest.raises(auth.AuthenticationError) as unknown:
+        auth.verify(job_settings, "atk_" + "x" * 43)
+
+    assert str(revoked.value) == str(unknown.value)
+
+
+def test_the_tenant_header_cannot_override_a_presented_key(authed_settings) -> None:
+    """The bypass this precedence exists to close.
+
+    If both were honoured, anyone with a valid key could act as any tenant by naming it in a
+    header. A key wins and the header is not read at all.
+    """
+    from transcription import auth
+
+    owner = uuid.uuid4()
+    victim = uuid.uuid4()
+    plaintext, _ = auth.create_api_key(authed_settings, tenant_id=owner, name="ci")
+
+    resolved = auth.resolve_tenant(
+        authed_settings,
+        authorization=f"Bearer {plaintext}",
+        tenant_header=str(victim),
+    )
+
+    assert resolved == owner, "the header must be ignored when a key is presented"
+
+
+def test_the_job_api_refuses_unauthenticated_requests_when_required(authed_client) -> None:
+    for method, path in (
+        ("get", "/v1/jobs"),
+        ("get", f"/v1/jobs/{uuid.uuid4()}"),
+        ("delete", f"/v1/jobs/{uuid.uuid4()}"),
+    ):
+        response = getattr(authed_client, method)(path)
+        assert response.status_code == 401, f"{method.upper()} {path} was not protected"
+        assert response.json()["error"]["code"] == "unauthenticated"
+        # RFC 9110: a 401 has to say which scheme to use.
+        assert response.headers["www-authenticate"].startswith("Bearer")
+
+    # And the header alone buys nothing once authentication is required.
+    assert (
+        authed_client.get(
+            "/v1/jobs", headers={"X-Tenant-Id": str(uuid.uuid4())}
+        ).status_code
+        == 401
+    )
+
+
+@ffmpeg_required
+def test_an_authenticated_client_only_sees_its_own_tenants_jobs(
+    authed_client, authed_settings, make_audio
+) -> None:
+    from transcription import auth
+
+    mine, _ = auth.create_api_key(authed_settings, tenant_id=uuid.uuid4(), name="mine")
+    theirs, _ = auth.create_api_key(authed_settings, tenant_id=uuid.uuid4(), name="theirs")
+    source = make_audio("mine.wav", seconds=1.0)
+
+    with source.open("rb") as handle:
+        created = authed_client.post(
+            "/v1/jobs",
+            files={"file": ("mine.wav", handle)},
+            headers={"Authorization": f"Bearer {mine}"},
+        )
+    assert created.status_code == 201
+    job_id = created.json()["id"]
+
+    assert (
+        authed_client.get(
+            f"/v1/jobs/{job_id}", headers={"Authorization": f"Bearer {mine}"}
+        ).status_code
+        == 200
+    )
+    assert (
+        authed_client.get(
+            f"/v1/jobs/{job_id}", headers={"Authorization": f"Bearer {theirs}"}
+        ).status_code
+        == 404
+    )
+    assert authed_client.get(
+        "/v1/jobs", headers={"Authorization": f"Bearer {theirs}"}
+    ).json()["data"] == []
+
+
+def test_a_malformed_authorization_header_is_refused(authed_client) -> None:
+    for header in ("", "Bearer", "Bearer ", "Basic abc", "atk_nokeyword"):
+        response = authed_client.get("/v1/jobs", headers={"Authorization": header})
+        assert response.status_code == 401, f"{header!r} should not authenticate"
+
+
+def test_the_scheme_is_matched_case_insensitively(job_settings, tenant) -> None:
+    """Clients vary, and rejecting `bearer` would be pedantry rather than security."""
+    from transcription import auth
+
+    plaintext, _ = auth.create_api_key(job_settings, tenant_id=tenant, name="ci")
+
+    for scheme in ("Bearer", "bearer", "BEARER"):
+        assert (
+            auth.resolve_tenant(
+                job_settings, authorization=f"{scheme} {plaintext}", tenant_header=None
+            )
+            == tenant
+        )
+
+
+def test_last_used_is_recorded_but_not_on_every_request(job_settings, tenant) -> None:
+    """An unconditional write per call would turn a read path into a write path."""
+    from transcription import auth
+
+    plaintext, record = auth.create_api_key(job_settings, tenant_id=tenant, name="ci")
+
+    auth.verify(job_settings, plaintext)
+    with db.transaction(job_settings) as conn:
+        first = conn.execute(
+            "SELECT last_used_at FROM api_keys WHERE id = %s", (record.id,)
+        ).fetchone()[0]
+    assert first is not None
+
+    auth.verify(job_settings, plaintext)
+    with db.transaction(job_settings) as conn:
+        second = conn.execute(
+            "SELECT last_used_at FROM api_keys WHERE id = %s", (record.id,)
+        ).fetchone()[0]
+    assert second == first, "a second call within the refresh window should not rewrite it"

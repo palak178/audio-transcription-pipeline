@@ -102,6 +102,11 @@ class Settings(BaseSettings):
     # clone must keep working with no database. Turning this on makes Postgres a hard
     # requirement, and the app will refuse to start without it rather than half-work.
     jobs_enabled: bool = False
+    # Require a per-tenant API key on the job endpoints. Off by default so a fresh clone
+    # works, and the process logs a warning on every start when the tier is mounted without
+    # it — an API that *looks* authenticated and is not is worse than one that is openly open.
+    # Mint keys with `transcribe apikey create`.
+    auth_required: bool = False
     # Postgres is both the job store and the queue. One datastore means the state machine and
     # the queue position move in a single transaction; see migrations/001_jobs.sql for why
     # that is worth more here than a dedicated broker.

@@ -229,6 +229,108 @@ def worker(
     run_worker(latency_class=latency_class, migrate=migrate)
 
 
+apikey_app = typer.Typer(help="Manage per-tenant API keys for the job API.")
+app.add_typer(apikey_app, name="apikey")
+
+
+@apikey_app.command("create")
+def apikey_create(
+    tenant: Annotated[
+        str | None,
+        typer.Option("--tenant", help="Tenant UUID. Omit to generate a fresh tenant."),
+    ] = None,
+    name: Annotated[
+        str, typer.Option("--name", help="Label, e.g. who or what holds it.")
+    ] = "default",
+) -> None:
+    """Mint an API key and print it once.
+
+    The secret is shown here and nowhere else — only its SHA-256 digest is stored, so a lost
+    key is replaced rather than recovered. That is the property that makes a stolen database
+    dump useless.
+    """
+    import uuid as _uuid
+
+    from transcription import auth, db
+    from transcription.config import Settings
+
+    settings = Settings()
+    try:
+        tenant_id = _uuid.UUID(tenant) if tenant else _uuid.uuid4()
+    except ValueError:
+        typer.secho(
+            f"error: --tenant must be a UUID, got {tenant!r}", fg=typer.colors.RED, err=True
+        )
+        raise typer.Exit(code=2) from None
+
+    db.migrate(settings)
+    plaintext, record = auth.create_api_key(settings, tenant_id=tenant_id, name=name)
+
+    typer.secho(
+        "API key created. This is the only time it is shown.",
+        fg=typer.colors.YELLOW,
+        err=True,
+    )
+    typer.echo(f"tenant: {record.tenant_id}", err=True)
+    typer.echo(f"name:   {record.name}", err=True)
+    typer.echo(plaintext)
+
+
+@apikey_app.command("list")
+def apikey_list(
+    tenant: Annotated[
+        str | None, typer.Option("--tenant", help="Filter by tenant UUID.")
+    ] = None,
+) -> None:
+    """List keys. Shows prefixes and usage, never secrets."""
+    import uuid as _uuid
+
+    from transcription import auth, db
+    from transcription.config import Settings
+
+    settings = Settings()
+    db.migrate(settings)
+    tenant_id = _uuid.UUID(tenant) if tenant else None
+
+    keys = auth.list_api_keys(settings, tenant_id=tenant_id)
+    if not keys:
+        typer.echo("no keys", err=True)
+        return
+    for key in keys:
+        state = "revoked" if key.revoked_at else "active"
+        used = key.last_used_at.isoformat() if key.last_used_at else "never"
+        typer.echo(
+            f"{key.id}  {key.key_prefix}...  {state:7}  "
+            f"{key.tenant_id}  used={used}  {key.name}"
+        )
+
+
+@apikey_app.command("revoke")
+def apikey_revoke(
+    key_id: Annotated[str, typer.Argument(help="Key id from `apikey list`.")],
+) -> None:
+    """Revoke a key. Recorded as a timestamp rather than deleted, so there is an audit trail."""
+    import uuid as _uuid
+
+    from transcription import auth, db
+    from transcription.config import Settings
+
+    settings = Settings()
+    db.migrate(settings)
+    try:
+        parsed = _uuid.UUID(key_id)
+    except ValueError:
+        typer.secho(f"error: not a key id: {key_id!r}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from None
+
+    if auth.revoke(settings, key_id=parsed):
+        typer.secho(f"revoked {parsed}", fg=typer.colors.GREEN, err=True)
+    else:
+        typer.secho(f"no active key {parsed}", fg=typer.colors.YELLOW, err=True)
+        raise typer.Exit(code=1)
+
+
+
 def main(argv: list[str] | None = None) -> None:
     """Console-script entry point."""
     app(expand_default_command(list(sys.argv[1:] if argv is None else argv)))

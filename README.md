@@ -43,7 +43,7 @@ brew install ffmpeg                    # macOS
 make setup      # virtualenv + install (needs uv — plain-pip path below)
 make warm       # downloads the model once (74 MB) — do it now, not mid-demo
 make demo       # transcribes the committed sample, prints JSON and SRT
-make test       # 196 tests, ~6 s, no model weights needed
+make test       # 205 tests, ~7 s, no model weights needed
 ```
 
 <details>
@@ -356,6 +356,15 @@ volume.
 It is **opt-in**, because the synchronous path needs nothing but ffmpeg and a model, and a
 fresh clone must keep working with no database.
 
+The whole stack in one command — Postgres, the API and a worker:
+
+```bash
+docker compose up --build
+curl -s -F file=@samples/speech_en.mp3 localhost:8000/v1/jobs | jq
+```
+
+Or against a local Postgres, if you have one:
+
 ```bash
 make db-setup        # createdb transcription + transcription_test
 make migrate         # apply migrations/*.sql
@@ -405,6 +414,36 @@ so a worker lost three hours into a four-hour file re-reads the WAV — seconds 
 inference on what it already did. Guarded by a fingerprint of the windowing plan: change the
 window size and window 7 is a different stretch of audio, so the checkpoints are discarded
 rather than stitched into a transcript that would be wrong undetectably.
+
+### Authentication
+
+Off by default, so `docker compose up` works with no setup — and the process **logs a warning
+on every start** while it is off, because an API that looks authenticated and is not is worse
+than one that is openly open.
+
+```bash
+transcribe apikey create --name "my laptop"   # printed once, never again
+transcribe apikey list                        # prefixes and usage, never secrets
+transcribe apikey revoke <id>
+
+TRANSCRIBE_AUTH_REQUIRED=true make serve-jobs
+curl -H "Authorization: Bearer atk_..." localhost:8000/v1/jobs
+```
+
+Three decisions here are deliberate, and each is a place where the obvious choice is wrong:
+
+- **Keys are hashed with SHA-256, not bcrypt or argon2.** A slow KDF exists to make guessing
+  low-entropy *passwords* expensive. These are 256 bits from a CSPRNG, so guessing is not the
+  threat model, and a slow hash would add latency to every request to defend against an attack
+  nobody can mount. It would also break the lookup: per-row salting means finding a key would
+  mean scanning every row and hashing against each, where a plain digest is a unique index and
+  one probe.
+- **`X-Tenant-Id` is ignored once a key is presented.** Honouring both would make the header a
+  one-line authorisation bypass — authenticate as yourself, then name someone else's tenant.
+- **A revoked key and an unknown key return the same message.** Distinguishing them turns the
+  error into an oracle for which keys exist.
+
+Revocation is a timestamp rather than a `DELETE`, so an incident leaves an audit trail.
 
 ### Storage
 
@@ -611,7 +650,7 @@ request.
 ## Testing
 
 ```bash
-make test        # 196 tests, ~6 s, no model weights required
+make test        # 205 tests, ~7 s, no model weights required
 make test-all    # adds 10 real-model integration tests
 make lint
 ```
@@ -655,7 +694,8 @@ These are deliberately design rather than code, and DESIGN.md covers each one:
 
 | Not built | Why |
 |---|---|
-| Webhooks, auth, per-tenant quotas, rate limits | Designed, not built. The `tenant_id` column and query scoping exist; the authentication that would populate it does not, so the job API takes a tenant from a header with a documented default — openly open rather than pretending otherwise |
+| Webhooks | Designed, not built. Polling works; a webhook needs its own signed delivery and retry schedule |
+| Per-tenant quotas and rate limits | Designed, not built. Authentication now exists to hang them off, which is the part that had to come first |
 | Presigned direct-to-storage upload | Designed. Content-hash idempotency and the storage abstraction are built; presigning only means anything for the S3 backend |
 | Alerting on DLQ depth and RTF regression | The metrics are exposed at `GET /v1/queue`; wiring them to a pager is deployment, not code |
 | Speaker diarisation — **the model backend only** | Everything around the model is built and tested: the overlapping window grid, the global clustering that makes labels mean the same thing across windows, boundary de-duplication, alignment onto segments, the schema and all four exporters (`diarisation.py`). The segmentation and embedding model is not, because `pyannote`'s weights are gated behind a Hugging Face licence and requiring one would break the offline, token-free setup above. Asking for diarisation returns `diarisation.status: failed` with `diarisation_unavailable` — a clear omission rather than a shaky implementation. [DESIGN.md](docs/DESIGN.md#how-would-you-add-speaker-diarisation) has the full design and the part-by-part state |
@@ -762,11 +802,12 @@ src/transcription/
   cli.py           transcribe / inspect / warm / worker
   api.py           POST /v1/transcriptions, GET /healthz
   api_jobs.py      the asynchronous tier: /v1/jobs, opt-in
+  auth.py          per-tenant API keys, hashed and revocable
 migrations/        numbered SQL, applied in one transaction each
 docs/
   DESIGN.md        production architecture (design only, nothing implemented)
   RUNNING.md       step-by-step setup, every command to try, troubleshooting
-tests/             196 fast + 10 slow
+tests/             205 fast + 10 slow
 scripts/           make_fixtures.sh
 samples/           one committed 43 KB recording
 README.md          this file — architecture and design decisions

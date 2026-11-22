@@ -1,0 +1,89 @@
+# The whole service in one command: Postgres, the API, and a worker pool.
+#
+#   docker compose up --build
+#   curl -s -F file=@samples/speech_en.mp3 localhost:8000/v1/jobs | jq
+#
+# This exists because the asynchronous tier was previously unreachable without installing
+# Postgres by hand, which is a lot to ask of someone who just wants to see it work.
+#
+# The detail worth noticing is `blobs`. The API writes uploaded audio to the blob store and the
+# worker reads it back, so with the filesystem backend they **must** share that directory. A
+# bind mount per container would give each its own empty copy and every job would fail with
+# `blob_not_found` — which is exactly the bug the S3 backend exists to remove once more than one
+# machine is involved.
+
+name: audio-transcription-service
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: transcription
+      POSTGRES_PASSWORD: transcription
+      POSTGRES_DB: transcription
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # The API and the worker both migrate on startup, so they must not race the database
+    # finishing its own initialisation. `service_healthy` below is what orders that.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U transcription -d transcription"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    # Exposed so `psql` and the test suite on the host can reach it. Drop this line to keep
+    # the database private to the compose network.
+    ports:
+      - "5432:5432"
+
+  api:
+    build:
+      context: .
+      args:
+        # tiny keeps the image small and the first run fast. Override for real accuracy.
+        MODEL: tiny
+    # The image's entrypoint is the CLI, which is what `docker run` is usually wanted for.
+    # Serving the API means overriding it.
+    entrypoint: ["python", "-m", "uvicorn"]
+    command: ["transcription.api:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      TRANSCRIBE_JOBS_ENABLED: "true"
+      TRANSCRIBE_DATABASE_URL: postgresql://transcription:transcription@postgres:5432/transcription
+      TRANSCRIBE_BLOB_ROOT: /var/lib/transcription/blobs
+      TRANSCRIBE_WHISPER_MODEL: tiny
+      # Left off so `docker compose up` works with no setup. The process logs a warning on
+      # every start while it is off. To lock it down:
+      #   docker compose exec api python -m transcription.cli apikey create --name local
+      #   then set this to true and restart.
+      TRANSCRIBE_AUTH_REQUIRED: "false"
+    volumes:
+      - blobs:/var/lib/transcription/blobs
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      args:
+        MODEL: tiny
+    command: ["worker"]
+    environment:
+      TRANSCRIBE_DATABASE_URL: postgresql://transcription:transcription@postgres:5432/transcription
+      TRANSCRIBE_BLOB_ROOT: /var/lib/transcription/blobs
+      TRANSCRIBE_WHISPER_MODEL: tiny
+    volumes:
+      # The same named volume the API writes to. See the note at the top of this file.
+      - blobs:/var/lib/transcription/blobs
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Scale the pool to taste: `docker compose up --scale worker=3`. Workers coordinate
+    # through Postgres, so none of them needs to know how many others exist.
+    deploy:
+      replicas: 1
+
+volumes:
+  pgdata:
+  blobs:
