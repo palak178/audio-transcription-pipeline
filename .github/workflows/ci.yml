@@ -21,6 +21,26 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12"]
+    # The job tier's tests are skipped when there is no database, which is right for someone
+    # cloning this to read the pipeline — and wrong for CI. A real Postgres here is what makes
+    # the lease, backoff and SKIP LOCKED tests actually run rather than silently pass.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: transcription_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      TRANSCRIBE_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/transcription_test
+
     steps:
       - uses: actions/checkout@v7
 
@@ -47,3 +67,14 @@ jobs:
 
       - name: Tests
         run: python -m pytest -q
+
+      # The job-tier tests skip themselves when no database is reachable, so a broken service
+      # block would look exactly like a green run. Fail loudly instead of quietly losing
+      # coverage of the queue.
+      - name: Assert the job-tier tests actually ran
+        run: |
+          python -m pytest tests/test_jobs.py -q 2>&1 | tee /tmp/jobs.log
+          if grep -qE '^s+' /tmp/jobs.log || grep -q 'skipped' /tmp/jobs.log; then
+            echo "::error::job-tier tests were skipped - Postgres was not reachable"
+            exit 1
+          fi

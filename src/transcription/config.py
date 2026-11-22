@@ -78,6 +78,54 @@ class Settings(BaseSettings):
     # vote drags a cluster; inheriting a neighbour's label is wrong only locally.
     diarisation_min_embedding_seconds: float = Field(default=1.0, gt=0)
 
+    # --- Storage --------------------------------------------------------------------------
+    # `filesystem` or `s3`. The filesystem backend is the default on purpose: requiring an S3
+    # account would cost this project the offline, no-credentials property it is most
+    # distinctive for. Both backends use the same content-addressed key layout, so moving
+    # between them does not rewrite any URI. See blobstore.py.
+    blob_store: str = "filesystem"
+    blob_root: str = "./var/blobs"
+    # Only read when blob_store is `s3`. `s3_endpoint_url` is what points this at MinIO,
+    # Ceph or R2 instead of AWS.
+    s3_bucket: str = ""
+    s3_prefix: str = ""
+    s3_region: str | None = None
+    s3_endpoint_url: str | None = None
+    # The design treats a voice recording as biometric personal data, so encryption at rest
+    # is a design constraint rather than a footnote. `AES256` or `aws:kms`.
+    s3_sse: str | None = None
+    s3_sse_kms_key_id: str | None = None
+
+    # --- Job queue ------------------------------------------------------------------------
+    # Mounts the asynchronous /v1/jobs endpoints and migrates on startup. Off by default on
+    # purpose: the synchronous endpoint needs nothing but ffmpeg and a model, and a fresh
+    # clone must keep working with no database. Turning this on makes Postgres a hard
+    # requirement, and the app will refuse to start without it rather than half-work.
+    jobs_enabled: bool = False
+    # Postgres is both the job store and the queue. One datastore means the state machine and
+    # the queue position move in a single transaction; see migrations/001_jobs.sql for why
+    # that is worth more here than a dedicated broker.
+    database_url: str = "postgresql:///transcription"
+    database_pool_min: int = Field(default=1, ge=1)
+    database_pool_max: int = Field(default=8, ge=1)
+    # How long a claimed job stays leased without a heartbeat. A worker that dies stops
+    # extending this, and the job becomes claimable again — which is what makes at-least-once
+    # delivery work without orphaning jobs in `running` forever.
+    job_lease_seconds: float = Field(default=60.0, gt=0)
+    # Heartbeats must be comfortably more frequent than the lease, or a healthy worker loses
+    # a job it is still working on.
+    job_heartbeat_seconds: float = Field(default=15.0, gt=0)
+    job_max_attempts: int = Field(default=5, ge=1)
+    # Backoff is expressed as `available_at` in the future rather than a separate retry queue.
+    job_backoff_base_seconds: float = Field(default=5.0, gt=0)
+    job_backoff_max_seconds: float = Field(default=600.0, gt=0)
+    # How long a worker waits before asking for work again when the queue is empty.
+    worker_poll_seconds: float = Field(default=2.0, gt=0)
+    # Audio longer than this is routed to the `long` latency class, so a batch of multi-hour
+    # recordings cannot starve interactive clips. Compared against duration x expected RTF
+    # rather than duration alone, since diarisation roughly doubles the cost of a job.
+    long_job_threshold_seconds: float = Field(default=600.0, gt=0)
+
     # --- Limits ---------------------------------------------------------------------------
     # Checked against the *probed* duration before decoding, so a 1 MB file that expands to
     # six hours of audio is rejected rather than decoded.

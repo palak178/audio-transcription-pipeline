@@ -1,6 +1,7 @@
 PY := .venv/bin/python
 UV := uv
 MODEL ?= base
+DATABASE_URL ?= postgresql:///transcription
 SAMPLE ?= samples/speech_en.mp3
 
 .DEFAULT_GOAL := help
@@ -44,6 +45,22 @@ demo-long:  ## Transcribe a ~6 minute file, showing per-segment progress (run `m
 
 serve:  ## Run the HTTP API on :8000
 	TRANSCRIBE_WHISPER_MODEL=$(MODEL) $(PY) -m uvicorn transcription.api:app --host 0.0.0.0 --port 8000
+
+serve-jobs:  ## Run the API with the asynchronous job tier (needs Postgres)
+	TRANSCRIBE_JOBS_ENABLED=true TRANSCRIBE_DATABASE_URL=$(DATABASE_URL) \
+		$(PY) -m uvicorn transcription.api:app --host 0.0.0.0 --port 8000
+
+work:  ## Run a transcription worker against the queue (needs Postgres)
+	TRANSCRIBE_DATABASE_URL=$(DATABASE_URL) $(PY) -m transcription.cli worker
+
+migrate:  ## Apply database migrations
+	TRANSCRIBE_DATABASE_URL=$(DATABASE_URL) $(PY) -c \
+		"from transcription.config import Settings; from transcription import db; \
+		print('applied:', db.migrate(Settings()) or 'nothing to do')"
+
+db-setup:  ## Create the local development and test databases
+	-createdb transcription
+	-createdb transcription_test
 
 docker-build:  ## Build the container (bundles ffmpeg and the model)
 	docker build --build-arg MODEL=$(MODEL) -t audio-transcription-service .

@@ -13,8 +13,10 @@ on anyone having run ``make fixtures`` first. The one committed binary,
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
+import uuid
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -207,6 +209,70 @@ def embedding(*values: float) -> np.ndarray:
     import numpy as np
 
     return np.array(values, dtype=np.float32)
+
+
+# The asynchronous tier needs a real Postgres. Pointed by env var so CI and a developer's
+# machine can differ, and *skipped* rather than failed when there is no database — someone
+# cloning this to read the pipeline should still get a green suite without installing
+# Postgres. CI sets the variable, so the tests genuinely run there.
+TEST_DATABASE_URL = os.environ.get(
+    "TRANSCRIBE_TEST_DATABASE_URL", "postgresql:///transcription_test"
+)
+
+
+def _database_available() -> bool:
+    try:
+        import psycopg
+
+        with psycopg.connect(TEST_DATABASE_URL, connect_timeout=3) as conn:
+            conn.execute("SELECT 1")
+        return True
+    except Exception:
+        return False
+
+
+postgres_required = pytest.mark.skipif(
+    not _database_available(),
+    reason=f"no Postgres at {TEST_DATABASE_URL} (set TRANSCRIBE_TEST_DATABASE_URL)",
+)
+
+
+@pytest.fixture
+def job_settings(tmp_path: Path) -> Iterator[Settings]:
+    """Settings wired to the test database, with the tables emptied.
+
+    Truncating per test rather than using a transaction-per-test rollback: the queue is the
+    thing under test, and ``FOR UPDATE SKIP LOCKED`` behaves differently inside one shared
+    transaction than it does across the separate connections a real worker uses. Testing it
+    through a rollback harness would be testing a different system.
+    """
+    from transcription import db
+
+    settings = Settings(
+        database_url=TEST_DATABASE_URL,
+        blob_root=str(tmp_path / "blobs"),
+        whisper_model="fake",
+        jobs_enabled=True,
+        job_max_attempts=3,
+        job_lease_seconds=30.0,
+        # Effectively every progress callback, so a test does not wait to see a beat.
+        job_heartbeat_seconds=0.001,
+        job_backoff_base_seconds=4.0,
+        max_upload_bytes=8 * 1024 * 1024,
+    )
+    db.migrate(settings)
+    with db.transaction(settings) as conn:
+        conn.execute("TRUNCATE jobs CASCADE")
+    yield settings
+    with db.transaction(settings) as conn:
+        conn.execute("TRUNCATE jobs CASCADE")
+
+
+@pytest.fixture
+def tenant() -> uuid.UUID:
+    import uuid
+
+    return uuid.uuid4()
 
 
 @pytest.fixture

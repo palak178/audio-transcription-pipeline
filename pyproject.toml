@@ -27,6 +27,12 @@ dependencies = [
     # Imported directly by audio.py. It arrives transitively via faster-whisper, but a direct
     # import deserves a direct declaration.
     "numpy>=1.26",
+    # Postgres holds job state *and* is the queue. See docs/DESIGN.md: one datastore means the
+    # state machine and the queue position move in a single transaction, rather than two
+    # systems that can disagree. psycopg 3, used synchronously behind a pool and called from
+    # the API via anyio.to_thread — the same pattern inference already uses, so there is one
+    # concurrency model in the codebase rather than two.
+    "psycopg[binary,pool]>=3.2",
 ]
 
 [project.optional-dependencies]
@@ -34,6 +40,16 @@ dev = [
     "pytest>=8.3.0",
     "httpx>=0.27.0",
     "ruff>=0.8.0",
+    # Emulates S3 in-process, so the S3 blob store is covered by real tests rather than
+    # mocks, and without anyone needing an AWS account or credentials.
+    "moto[s3]>=5.0.0",
+    "boto3>=1.35.0",
+]
+
+# The S3 blob store. Optional on purpose: the filesystem backend is the default and needs no
+# account, which is what keeps a fresh clone fully offline.
+s3 = [
+    "boto3>=1.35.0",
 ]
 
 [project.scripts]

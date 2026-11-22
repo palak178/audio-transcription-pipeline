@@ -25,3 +25,6 @@ samples/generated/
 
 # Scratch space: local notes and throwaway tooling, nothing the project needs to build or run.
 .local/
+
+# Local blob storage for the job tier (content-addressed audio).
+var/

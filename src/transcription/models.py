@@ -384,6 +384,88 @@ class TranscriptionResult(BaseModel):
         return round(self.processing_seconds / self.audio.duration_seconds, 4)
 
 
+class JobError(BaseModel):
+    """Why a job is not going to produce a transcript."""
+
+    code: str = Field(description="Stable machine-readable code. Match on this.")
+    message: str | None = Field(default=None, description="Human-readable detail.")
+
+
+class JobResource(BaseModel):
+    """An asynchronous transcription job, as a client sees it.
+
+    Deliberately narrower than the internal row. Lease holders, request fingerprints and
+    backoff timing are operational detail; exposing them would invite clients to depend on
+    mechanics that should stay free to change.
+
+    The **state machine is exposed on purpose**. A boolean "done" is not enough to build a
+    sane UI on: `queued` with a queue position means "wait", `running` with progress means
+    "show a bar", `failed` means "show the error", and `dead_letter` means "a human needs to
+    look at this". Collapsing those into one flag pushes the distinction onto every client.
+    """
+
+    id: str = Field(description="Job identifier.", examples=["0f2b…"])
+    status: Literal["queued", "running", "succeeded", "failed", "dead_letter"] = Field(
+        description=(
+            "`queued` → `running` → `succeeded` | `failed`. A job whose worker died returns "
+            "to `queued`; one that exhausts its retries becomes `dead_letter`."
+        ),
+        examples=["running"],
+    )
+    progress: float = Field(
+        description="Fraction of the audio transcribed, 0-1.", examples=[0.42]
+    )
+    attempts: int = Field(description="How many times this job has been claimed.")
+    max_attempts: int = Field(description="Attempts allowed before dead-lettering.")
+    latency_class: Literal["short", "long"] = Field(
+        description=(
+            "Which queue this job is in. Assigned from estimated compute, not duration, so a "
+            "diarised clip sorts with longer work."
+        )
+    )
+
+    audio: dict = Field(description="Filename, duration and content hash of the input.")
+    options: dict = Field(description="Model and decoding options this job was created with.")
+
+    transcript_url: str | None = Field(
+        default=None, description="Where to fetch the result once `status` is `succeeded`."
+    )
+    error: JobError | None = Field(default=None, description="Set when the job will not finish.")
+
+    created_at: datetime
+    updated_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+
+
+class JobList(BaseModel):
+    """A page of jobs, newest first."""
+
+    data: list[JobResource]
+    next_cursor: str | None = Field(
+        default=None,
+        description=(
+            "Pass as `cursor` for the next page. `null` on the last page. Keyset-based, so "
+            "pages do not skip or repeat rows when jobs are created while you page."
+        ),
+    )
+
+
+class QueueStats(BaseModel):
+    """Operational view of the queue.
+
+    `oldest_claimable_age_seconds` is the number to autoscale on. Mean depth hides what
+    matters: audio arrives in bursts, so a queue that is empty on average can still have a job
+    that has been waiting twenty minutes.
+    """
+
+    by_status: dict[str, int] = Field(description="Job count per status.")
+    claimable: int = Field(description="Jobs due to be picked up right now.")
+    oldest_claimable_age_seconds: float = Field(
+        description="How long the longest-waiting due job has been waiting."
+    )
+
+
 class ErrorDetail(BaseModel):
     """The body of an error response.
 

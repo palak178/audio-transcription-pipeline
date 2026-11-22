@@ -195,6 +195,40 @@ def expand_default_command(args: list[str]) -> list[str]:
     return [DEFAULT_COMMAND, *args]
 
 
+@app.command()
+def worker(
+    latency_class: Annotated[
+        str | None,
+        typer.Option(
+            "--latency-class",
+            help="Only take `short` or `long` jobs. Omit to take either.",
+        ),
+    ] = None,
+    migrate: Annotated[
+        bool, typer.Option("--migrate/--no-migrate", help="Apply migrations on startup.")
+    ] = True,
+) -> None:
+    """Run a transcription worker: claim jobs from the queue and transcribe them.
+
+    This is the process that does the slow work. Run as many as you have cores to spare;
+    they coordinate through Postgres, so nothing needs to know how many there are.
+
+    Stops gracefully on SIGTERM or Ctrl-C — it finishes the job in flight first, so a routine
+    deploy does not throw away minutes of transcription.
+    """
+    from transcription.worker import run as run_worker
+
+    if latency_class not in (None, "short", "long"):
+        typer.secho(
+            f"error: --latency-class must be `short` or `long`, got {latency_class!r}",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    run_worker(latency_class=latency_class, migrate=migrate)
+
+
 def main(argv: list[str] | None = None) -> None:
     """Console-script entry point."""
     app(expand_default_command(list(sys.argv[1:] if argv is None else argv)))

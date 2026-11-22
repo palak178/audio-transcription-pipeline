@@ -185,6 +185,26 @@ def create_app(
             await anyio.to_thread.run_sync(engine.warm)
             app.state.transcriber = engine
             logger.info("model %s ready", resolved_settings.whisper_model)
+
+        # The asynchronous tier is opt-in, because it needs Postgres and the synchronous
+        # endpoint does not. Mounted here rather than at import time so that the settings
+        # actually in force decide, and so a test can build either shape of app.
+        if resolved_settings.jobs_enabled:
+            from transcription import db
+            from transcription.api_jobs import create_jobs_router
+
+            # Migrating on startup means a deployment needs no separate step to be correct.
+            # Failing loudly if the database is unreachable is deliberate: the operator asked
+            # for this tier, so silently serving a half-working API would be worse.
+            applied = await anyio.to_thread.run_sync(partial(db.migrate, resolved_settings))
+            if applied:
+                logger.info("applied migrations: %s", ", ".join(applied))
+            app.include_router(create_jobs_router(resolved_settings))
+            # FastAPI caches the generated schema, so it has to be dropped after a late mount
+            # or /docs would show the app as it was before the router arrived.
+            app.openapi_schema = None
+            logger.info("asynchronous job API mounted at /v1/jobs")
+
         yield
 
     app = FastAPI(

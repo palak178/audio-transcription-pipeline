@@ -1,15 +1,21 @@
 # Production System Design
 
-> **Almost nothing in this document is implemented.** It describes the architecture this
-> pipeline would need to run as a real service, and it is deliberately design rather than code.
-> Where the repository already contains a seam the production design would plug into, I point at
-> the file. The boundary is discussed in
-> [README.md](../README.md#what-is-deliberately-not-built).
+> **Much of this document is now implemented.** It started as design only. The sections below
+> mark what is code and what is still design, section by section, and where implementing it
+> proved the design wrong I have said so rather than quietly editing the design to match.
 >
-> The one exception is **speaker diarisation**, where everything except the model backend is now
-> built and tested — the window grid, the global clustering, the boundary de-duplication, the
-> alignment and the output schema, in `diarisation.py`. That section marks what is code and what
-> is still design.
+> | Section | State |
+> |---|---|
+> | Concurrent uploads | Design. The worker tier that makes it real is built. |
+> | Storing audio and transcripts | **Built** — `blobstore.py`, filesystem and S3 backends |
+> | Retry and recovery | **Built** — `jobstore.py`, `checkpoint.py`, `worker.py` |
+> | Speaker diarisation | **Built except the model backend** — `diarisation.py` |
+> | Exposing this as an API | **Built** — `api_jobs.py`, at `/v1/jobs` |
+> | Auth, quotas, webhooks | Design |
+>
+> Three places where building it corrected the design, each marked in context below: the queue
+> is Postgres rather than SQS, idempotency needed more than `(tenant, audio, model)`, and
+> clustering's real memory cost is the distance matrix rather than the embeddings.
 
 The single idea the rest of this document follows from:
 
@@ -100,6 +106,13 @@ primitive at this scale; real concurrency is the queue above.
 
 ## How would you store audio and transcripts?
 
+> **Built**, with one deviation. `blobstore.py` has two backends behind one protocol, and the
+> **filesystem one is the default** rather than S3. Making S3 mandatory would cost this project
+> the property it is most distinctive for — it runs fully offline, with no account and no
+> credentials. Both backends use the identical content-addressed key layout, so moving between
+> them rewrites no URI. The S3 backend is tested against `moto`, so it is covered without an
+> AWS account.
+
 Different data with different access patterns, so: **blobs in object storage, state in a
 relational database.**
 
@@ -142,7 +155,7 @@ CREATE TABLE jobs (
     created_at      timestamptz NOT NULL DEFAULT now(),
     updated_at      timestamptz NOT NULL DEFAULT now()
 );
-CREATE UNIQUE INDEX ON jobs (tenant_id, audio_sha256, model);  -- idempotency
+CREATE UNIQUE INDEX ON jobs (tenant_id, audio_sha256, model);  -- idempotency -- WRONG, see below
 CREATE INDEX ON jobs (status, created_at);                     -- queue/ops views
 
 CREATE TABLE segments (                -- only if per-segment search is a requirement
@@ -155,6 +168,15 @@ CREATE TABLE segments (                -- only if per-segment search is a requir
 );
 CREATE INDEX ON segments USING gin (to_tsvector('english', text));
 ```
+
+> **That idempotency index is a bug, found by implementing it.** Keyed on
+> `(tenant_id, audio_sha256, model)`, a `diarise: true` request de-duplicates against an earlier
+> plain run of the same audio and the caller gets a `200` carrying a transcript with no speaker
+> labels and no error — a wrong answer wearing a success. Anything that changes the output has
+> to be part of identity. Widening the index would work but needs a migration every time an
+> option is added, so what got built hashes the audio digest and a canonical encoding of every
+> output-affecting option into a single `request_fingerprint` column, unique per tenant. See
+> `jobstore.fingerprint` and `migrations/001_jobs.sql`.
 
 Postgres holds the state machine, because that is what needs transactions, and the fields
 people filter on. S3 holds the full document, because it is immutable and read whole. The
@@ -182,6 +204,21 @@ constraint rather than a footnote:
 ---
 
 ## How do you retry or recover failed transcriptions?
+
+> **Built.** `jobstore.py` holds the state machine and the queue, `worker.py` the loop,
+> `checkpoint.py` the resume path. The tests that pin the semantics are in `tests/test_jobs.py`.
+>
+> **The queue is Postgres, not SQS or Redis — this document was wrong.** One table with
+> `SELECT … FOR UPDATE SKIP LOCKED` makes claiming a job and recording that it was claimed the
+> *same statement*. Two systems make that a dual write that can disagree: a message delivered
+> whose row says `succeeded`, or a row marked `running` with no message behind it. The original
+> design conceded the problem without naming it, by insisting the attempt counter live "in the
+> `jobs` row, not only in the queue" — that instruction is a workaround for a bug that one
+> datastore simply does not have. The throughput argument for a broker does not apply at this
+> scale either: at the measured RTF of 0.27 a worker finishes about four one-hour jobs an hour,
+> so a thousand workers is a few thousand claims an hour, several orders of magnitude below what
+> `SKIP LOCKED` sustains. A broker earns its place when the queue outgrows the database, and
+> that is a long way from here.
 
 **The whole policy rests on one distinction: permanent versus transient.** Retrying a corrupt
 file five times just burns money five times and delays the error the user needs to see.
@@ -576,6 +613,17 @@ Three details fall out of that:
 
 ## How would you expose this as an API?
 
+> **Built**, at `/v1/jobs` rather than at `/v1/transcriptions` as proposed below. The reason is
+> the sentence right after this one: the synchronous endpoint stays a documented convenience,
+> and it needs no database. Overloading `POST /v1/transcriptions` to be asynchronous would mean
+> that documented, working, zero-infrastructure endpoint starts returning errors unless Postgres
+> is configured. A fresh clone must still transcribe with nothing but ffmpeg and a model.
+>
+> Jobs being their own collection turns out to be more honest REST anyway. A job has a status,
+> an attempt count and a progress fraction; a transcript has segments. `GET /v1/jobs/{id}`
+> answers "how is it going", `GET /v1/jobs/{id}/transcript` answers "what did it say", and
+> neither has to pretend to be the other. The whole tier is opt-in via `TRANSCRIBE_JOBS_ENABLED`.
+
 An **asynchronous, versioned, resource-oriented HTTP API**, keeping the synchronous endpoint as
 a documented convenience for short clips.
 
@@ -646,12 +694,20 @@ a boolean "done" — is what lets a client build a sane UI.
 
 Were this to become the real service, in order:
 
-1. Move transcription behind a queue with Postgres job state — this alone turns the current
-   documented duration limit into a non-issue.
-2. Presigned direct-to-S3 upload, and content-hash idempotency end to end.
-3. Retry policy, lease heartbeats and a dead-letter queue with alerting.
-4. Webhooks, then per-tenant auth and quotas.
-5. Window-level checkpointing, so a failure three hours into a four-hour file is cheap.
+1. ~~Move transcription behind a queue with Postgres job state.~~ **Done** — `jobstore.py`,
+   `worker.py`, `api_jobs.py`. The duration limit is now a property of the synchronous
+   convenience endpoint rather than of the system.
+2. Direct-to-storage upload with a presigned URL. **Partly done**: content-hash idempotency is
+   end to end, and storage is abstracted with two backends. Presigning is still design, and only
+   means anything for the S3 backend.
+3. ~~Retry policy, lease heartbeats and a dead-letter queue.~~ **Done** — permanent/transient
+   classification, leases with heartbeats, jittered exponential backoff, dead-lettering, and
+   lease reclaim for workers that die. Alerting is still design.
+4. Webhooks, then per-tenant auth and quotas. **Still design.** The tenant column and scoping
+   exist; the authentication that would populate it does not.
+5. ~~Window-level checkpointing.~~ **Done** — `checkpoint.py`. A retry re-reads the WAV but
+   skips inference on windows a previous attempt finished, guarded by a plan fingerprint so
+   changed settings discard the checkpoints rather than stitching a wrong transcript.
 6. A labelled accuracy benchmark — WER per model size, and a diarisation error rate. Nothing
    below this line can be tuned honestly without one; the clustering threshold above is the
    clearest example.

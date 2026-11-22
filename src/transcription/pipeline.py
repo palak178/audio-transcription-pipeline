@@ -41,6 +41,7 @@ from pathlib import Path
 
 from transcription import audio as audio_module
 from transcription import diarisation as diarisation_module
+from transcription.checkpoint import EMPTY_RESUME, Checkpointer
 from transcription.config import Settings, get_settings
 from transcription.diarisation import Diariser, SpeakerHint
 from transcription.errors import AudioTooLongError, DiarisationError
@@ -86,6 +87,7 @@ def transcribe_file(
     diarise: bool | None = None,
     diariser: Diariser | None = None,
     speakers: SpeakerHint | None = None,
+    checkpointer: Checkpointer | None = None,
 ) -> TranscriptionResult:
     """Transcribe an audio file of any ffmpeg-readable format.
 
@@ -105,6 +107,9 @@ def transcribe_file(
         diariser: Diarisation backend. Defaults to the one named in ``settings``.
         speakers: What the caller knows about the speaker count. A known count is the
             cheapest accuracy available here.
+        checkpointer: Records each window as it completes and skips windows a previous
+            attempt already finished. Turns a worker lost three hours into a four-hour file
+            from an hour of wasted CPU into a re-read. See :mod:`transcription.checkpoint`.
 
     Raises:
         TranscriptionError: Any subclass; see :mod:`transcription.errors`.
@@ -157,9 +162,13 @@ def transcribe_file(
 
         started = time.perf_counter()
         total = info.duration_seconds
-        segments: list[Segment] = []
-        detected_language: str | None = None
-        language_probability: float | None = None
+
+        # Anything a previous attempt finished. Empty unless a checkpointer was passed and it
+        # has usable state — see checkpoint.py for what "usable" means.
+        resume = checkpointer.load() if checkpointer is not None else EMPTY_RESUME
+        segments: list[Segment] = list(resume.segments)
+        detected_language: str | None = resume.language
+        language_probability: float | None = resume.language_probability
 
         windows = audio_module.iter_wav_windows(
             wav_path,
@@ -167,7 +176,17 @@ def transcribe_file(
             search_seconds=settings.window_search_seconds,
         )
 
-        for offset, samples in windows:
+        for window_index, (offset, samples) in enumerate(windows):
+            # Already transcribed on an earlier attempt. The window still had to be *read* —
+            # boundaries are content-dependent, so there is no way to seek to window N without
+            # walking the ones before it — but the expensive part, inference, is skipped.
+            if window_index in resume.completed_windows:
+                if progress is not None and total:
+                    progress(min(offset + len(samples) / 16_000, total), total)
+                continue
+
+            window_start = len(segments)
+
             # After the first window, pin the language. Detecting per window lets a window
             # that happens to be mostly silence or noise come back as a different language,
             # which then produces nonsense for that stretch of an otherwise fine recording.
@@ -187,6 +206,18 @@ def transcribe_file(
                 if progress is not None:
                     done = segments[-1].end
                     progress(min(done, total) if total else done, total)
+
+            # Checkpoint *after* the window is fully consumed, never during. A partial window
+            # recorded as complete would be silently truncated on resume — the one failure
+            # this whole mechanism must not introduce.
+            if checkpointer is not None:
+                checkpointer.save(
+                    window_index=window_index,
+                    offset_seconds=offset,
+                    segments=segments[window_start:],
+                    language=detected_language,
+                    language_probability=language_probability,
+                )
 
         processing_seconds = time.perf_counter() - started
 

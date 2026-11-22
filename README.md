@@ -21,12 +21,13 @@ found it growing linearly at ~1.45 MB per second of audio — so a four-hour rec
 about 21 GB and would have been killed, under a four-hour limit I had already shipped. That
 section is the measurement, the redesign, and what it did and did not buy.
 
-**Scope, stated up front.** The pipeline is built and tested. The production architecture it
-would need at scale — concurrent uploads, durable storage, retry and recovery, an asynchronous
-job API — is written up as design in [DESIGN.md](docs/DESIGN.md) rather than half-built.
+**Scope, stated up front.** The pipeline is built and tested. So is most of the production tier
+it needs at scale: a Postgres-backed job queue, a worker pool, retries with leases and
+dead-lettering, window-level checkpointing, pluggable blob storage, and an asynchronous job API.
+What remains design is authentication, quotas and webhooks.
 [What is deliberately not built](#what-is-deliberately-not-built) says exactly where that line
-falls and why, feature by feature. Drawing it explicitly is the point: a scope boundary you can
-see is worth more than one you have to discover.
+falls, feature by feature. Drawing it explicitly is the point: a scope boundary you can see is
+worth more than one you have to discover.
 
 ## Quick start
 
@@ -42,7 +43,7 @@ brew install ffmpeg                    # macOS
 make setup      # virtualenv + install (needs uv — plain-pip path below)
 make warm       # downloads the model once (74 MB) — do it now, not mid-demo
 make demo       # transcribes the committed sample, prints JSON and SRT
-make test       # 162 tests, ~4 s, no model weights needed
+make test       # 196 tests, ~6 s, no model weights needed
 ```
 
 <details>
@@ -91,7 +92,10 @@ This recording is a test fixture for the audio transcription service.
 | Concurrent uploads | *Design* — [DESIGN.md](docs/DESIGN.md#how-would-you-handle-concurrent-uploads) (plus an in-process semaphore in `api.py`) | `test_api.py` |
 | Storing audio and transcripts | *Design* — [DESIGN.md](docs/DESIGN.md#how-would-you-store-audio-and-transcripts) | — |
 | Retry / recovery | *Design* — [DESIGN.md](docs/DESIGN.md#how-do-you-retry-or-recover-failed-transcriptions) (classification exists in `errors.py`) | — |
-| Exposing this as an API | *Design* — [DESIGN.md](docs/DESIGN.md#how-would-you-expose-this-as-an-api) (plus the implemented sync API) | `test_api.py` |
+| Exposing this as an API | `api.py` (sync), `api_jobs.py` (async `/v1/jobs`) — [DESIGN.md](docs/DESIGN.md#how-would-you-expose-this-as-an-api) | `test_api.py`, `test_jobs.py` |
+| Job queue and worker tier | `jobstore.py`, `worker.py`, `migrations/` | `test_jobs.py` |
+| Retries, leases, dead-letter, checkpointing | `jobstore.py`, `checkpoint.py`, `errors.py` | `test_jobs.py` |
+| Audio storage (filesystem or S3) | `blobstore.py` | `test_jobs.py` (S3 via `moto`) |
 
 ---
 
@@ -342,6 +346,82 @@ matter how neatly memory is bounded. That is what [DESIGN.md](docs/DESIGN.md) ad
 
 ---
 
+## The asynchronous job tier
+
+Transcription takes minutes, so the synchronous endpoint caps audio at 10 minutes and points at
+the CLI. The job tier is the real answer: accept the bytes, record the intent durably,
+acknowledge immediately, and transcribe on a pool sized to compute rather than to request
+volume.
+
+It is **opt-in**, because the synchronous path needs nothing but ffmpeg and a model, and a
+fresh clone must keep working with no database.
+
+```bash
+make db-setup        # createdb transcription + transcription_test
+make migrate         # apply migrations/*.sql
+make serve-jobs      # API with /v1/jobs mounted, on :8000
+make work            # in another terminal: a worker that drains the queue
+```
+
+```bash
+# Submit. Returns 201 immediately — nothing here waits on compute.
+curl -s -F file=@recording.m4a localhost:8000/v1/jobs | jq
+# { "id": "…", "status": "queued", "progress": 0, "transcript_url": null, … }
+
+curl -s localhost:8000/v1/jobs/<id> | jq '.status, .progress'
+curl -s "localhost:8000/v1/jobs/<id>/transcript?format=srt"
+curl -s localhost:8000/v1/queue | jq      # depth, and the oldest waiting job
+```
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /v1/jobs` | Submit. `201` and a `Location`; `200` with the existing job if it is a duplicate |
+| `GET /v1/jobs/{id}` | Status, progress, attempt count, error |
+| `GET /v1/jobs/{id}/transcript?format=&speaker_labels=` | The artefact. `409` until the job succeeds |
+| `GET /v1/jobs?status=&cursor=&limit=` | Keyset-paginated list |
+| `DELETE /v1/jobs/{id}` | Erasure: row, transcript and audio blob |
+| `GET /v1/queue` | Depth by status and the oldest claimable job's age |
+
+### Four decisions worth knowing
+
+**Postgres is the queue, not SQS or Redis.** `SELECT … FOR UPDATE SKIP LOCKED` makes claiming a
+job and recording that it was claimed the *same statement*. Two systems make that a dual write
+that can disagree — a message delivered whose row says `succeeded`, or a row stuck in `running`
+with no message behind it. [DESIGN.md](docs/DESIGN.md) originally specified a broker; building
+it showed the broker was buying a problem rather than solving one. At RTF 0.27 a worker finishes
+about four audio-hours an hour, so queue throughput was never the constraint.
+
+**Leases, not a reaper process.** A claim is valid until `locked_until`; the worker extends it
+by heartbeating off the progress callback the pipeline already had. A worker that is OOM-killed
+or evicted stops extending, and any other worker returns the job to the queue. There is no
+dedicated reaper whose own death would silently strand every job.
+
+**Backoff is scheduling, not a second queue.** A retryable failure leaves a `queued` row with
+`available_at` in the future. One queue, nothing to keep in sync, and the attempt count visible
+to support staff in the row rather than buried in a broker.
+
+**Checkpoints make a long retry cheap.** Each window's segments are persisted as it completes,
+so a worker lost three hours into a four-hour file re-reads the WAV — seconds — and skips
+inference on what it already did. Guarded by a fingerprint of the windowing plan: change the
+window size and window 7 is a different stretch of audio, so the checkpoints are discarded
+rather than stitched into a transcript that would be wrong undetectably.
+
+### Storage
+
+Audio goes to a content-addressed blob store, **filesystem by default**. Requiring an S3 account
+would cost the offline, no-credentials property that makes this project distinctive. Both
+backends share one key layout, so switching rewrites no URI:
+
+```
+{root}/audio/{sha256[0:2]}/{sha256}          # filesystem, the default
+s3://{bucket}/audio/{sha256[0:2]}/{sha256}   # pip install -e ".[s3]"
+```
+
+The S3 backend is tested against `moto`, so it has real coverage without an account. Point
+`TRANSCRIBE_S3_ENDPOINT_URL` at MinIO, Ceph or R2 and it works the same.
+
+---
+
 ## Output contract
 
 The JSON is the contract for downstream consumers — designed to be depended on:
@@ -531,7 +611,7 @@ request.
 ## Testing
 
 ```bash
-make test        # 162 tests, ~4 s, no model weights required
+make test        # 196 tests, ~6 s, no model weights required
 make test-all    # adds 10 real-model integration tests
 make lint
 ```
@@ -575,18 +655,18 @@ These are deliberately design rather than code, and DESIGN.md covers each one:
 
 | Not built | Why |
 |---|---|
-| Job queue, worker tier, Redis/SQS | Production concurrency and recovery — designed, not built |
-| Postgres / S3 / durable job state | Audio and transcript storage — designed, not built |
-| Retries, leases, dead-letter queue | Designed, not built — though the *classification* that drives the policy is in `errors.py` (`code`, `retryable`) |
-| Asynchronous job API, webhooks | Designed, not built — the implemented API is synchronous and capped |
+| Webhooks, auth, per-tenant quotas, rate limits | Designed, not built. The `tenant_id` column and query scoping exist; the authentication that would populate it does not, so the job API takes a tenant from a header with a documented default — openly open rather than pretending otherwise |
+| Presigned direct-to-storage upload | Designed. Content-hash idempotency and the storage abstraction are built; presigning only means anything for the S3 backend |
+| Alerting on DLQ depth and RTF regression | The metrics are exposed at `GET /v1/queue`; wiring them to a pager is deployment, not code |
 | Speaker diarisation — **the model backend only** | Everything around the model is built and tested: the overlapping window grid, the global clustering that makes labels mean the same thing across windows, boundary de-duplication, alignment onto segments, the schema and all four exporters (`diarisation.py`). The segmentation and embedding model is not, because `pyannote`'s weights are gated behind a Hugging Face licence and requiring one would break the offline, token-free setup above. Asking for diarisation returns `diarisation.status: failed` with `diarisation_unavailable` — a clear omission rather than a shaky implementation. [DESIGN.md](docs/DESIGN.md#how-would-you-add-speaker-diarisation) has the full design and the part-by-part state |
-| Auth, quotas, rate limits, metrics | Out of scope here; designed in docs/DESIGN.md |
 | Parallel transcription of windows | Windows contend for the same cores, and CTranslate2 already parallelises a single request across them. Parallelism belongs *across* files, in the worker pool |
 | Streaming / live transcription | A genuinely different problem (partial hypotheses, revision) and out of scope |
 
-Two things on that list are partly present, because the pipeline needs them to be correct
-rather than to demonstrate anything: the in-process concurrency semaphore, and the content
-hash. Both are called out above.
+**What *is* built, which this table used to say was not:** the job queue and worker tier, the
+job state machine, both storage backends, the retry policy with leases and dead-lettering, and
+window-level checkpointing. That work is described in [DESIGN.md](docs/DESIGN.md), which marks
+each section as code or design and records three places where implementing it proved the design
+wrong.
 
 ---
 
@@ -612,6 +692,21 @@ Every setting is an environment variable prefixed `TRANSCRIBE_`; see
 | `TRANSCRIBE_DIARISATION_OVERLAP_SECONDS` | `15` | Overlap, so no turn is split into two unembeddable halves |
 | `TRANSCRIBE_DIARISATION_THRESHOLD` | `0.55` | Cosine distance to stop merging speakers. **An unvalidated placeholder** — picking it honestly needs labelled audio |
 | `TRANSCRIBE_DIARISATION_MIN_EMBEDDING_SECONDS` | `1.0` | Shorter turns are labelled from neighbours, not clustered |
+
+The asynchronous job tier is off by default, because the synchronous endpoint needs no database:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `TRANSCRIBE_JOBS_ENABLED` | `false` | Mount `/v1/jobs` and migrate on startup |
+| `TRANSCRIBE_DATABASE_URL` | `postgresql:///transcription` | Job store **and** queue |
+| `TRANSCRIBE_BLOB_STORE` | `filesystem` | `filesystem` or `s3` |
+| `TRANSCRIBE_BLOB_ROOT` | `./var/blobs` | Where the filesystem backend keeps audio |
+| `TRANSCRIBE_S3_BUCKET` / `_REGION` / `_ENDPOINT_URL` | — | Only read when the backend is `s3`. The endpoint points at MinIO or R2 |
+| `TRANSCRIBE_JOB_LEASE_SECONDS` | `60` | How long a claim survives without a heartbeat |
+| `TRANSCRIBE_JOB_HEARTBEAT_SECONDS` | `15` | Must be well under the lease |
+| `TRANSCRIBE_JOB_MAX_ATTEMPTS` | `5` | Attempts before dead-lettering |
+| `TRANSCRIBE_JOB_BACKOFF_BASE_SECONDS` | `5` | Doubles per attempt, jittered, capped |
+| `TRANSCRIBE_LONG_JOB_THRESHOLD_SECONDS` | `600` | Estimated compute above which a job goes to the `long` queue |
 
 ### Docker
 
@@ -658,13 +753,20 @@ src/transcription/
   models.py        the output contract (versioned pydantic schema)
   diarisation.py   speaker turns: window grid, global clustering, alignment (no model yet)
   exporters.py     json / srt / vtt / txt
-  pipeline.py      orchestration, windowing, stitching, progress
-  cli.py           transcribe / inspect / warm
+  pipeline.py      orchestration, windowing, stitching, progress, checkpointing
+  blobstore.py     content-addressed audio storage: filesystem (default) or S3
+  db.py            connection pool + migration runner (raw SQL, no ORM)
+  jobstore.py      job state machine and the queue (SELECT ... FOR UPDATE SKIP LOCKED)
+  checkpoint.py    per-window resume, so a retry does not re-transcribe hours
+  worker.py        claim -> transcribe -> report, with leases and heartbeats
+  cli.py           transcribe / inspect / warm / worker
   api.py           POST /v1/transcriptions, GET /healthz
+  api_jobs.py      the asynchronous tier: /v1/jobs, opt-in
+migrations/        numbered SQL, applied in one transaction each
 docs/
   DESIGN.md        production architecture (design only, nothing implemented)
   RUNNING.md       step-by-step setup, every command to try, troubleshooting
-tests/             162 fast + 10 slow
+tests/             196 fast + 10 slow
 scripts/           make_fixtures.sh
 samples/           one committed 43 KB recording
 README.md          this file — architecture and design decisions
