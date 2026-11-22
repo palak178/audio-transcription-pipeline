@@ -22,8 +22,8 @@ import uuid
 
 import pytest
 from fastapi.testclient import TestClient
+from tests.conftest import FakeTranscriber, ffmpeg_required, postgres_required
 
-from conftest import FakeTranscriber, ffmpeg_required, postgres_required
 from transcription import audio as audio_module
 from transcription import blobstore, db, jobstore
 from transcription.api import create_app

@@ -16,8 +16,8 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from tests.conftest import FakeDiariser, embedding, ffmpeg_required
 
-from conftest import FakeDiariser, embedding, ffmpeg_required
 from transcription import audio as audio_module
 from transcription import exporters
 from transcription.config import Settings

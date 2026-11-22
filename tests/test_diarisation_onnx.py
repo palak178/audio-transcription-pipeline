@@ -82,8 +82,7 @@ def two_speakers(tmp_path_factory) -> tuple[Path, list[tuple[float, float, str]]
         ],
         check=True, capture_output=True,
     )
-    sys.path.insert(0, str(SCRIPTS))
-    from evaluate_diarisation import read_rttm
+    from scripts.evaluate_diarisation import read_rttm
 
     return out.with_suffix(".wav"), read_rttm(out.with_suffix(".rttm"))
 
@@ -117,8 +116,7 @@ def test_a_two_speaker_recording_is_attributed_correctly(two_speakers, tmp_path)
     of generated labels onto reference ones — because `SPEAKER_00` and `Daniel` are the same
     person if that is the mapping that fits.
     """
-    sys.path.insert(0, str(SCRIPTS))
-    from evaluate_diarisation import score
+    from scripts.evaluate_diarisation import score
 
     wav, reference = two_speakers
     settings = onnx_settings()
