@@ -29,7 +29,7 @@ So:
   minutes needs to know the difference between "working" and "hung".
 
 The remaining constraint is wall-clock time, which is a scheduling problem rather than a
-pipeline problem: see docs/DESIGN.md.
+pipeline problem, solved by the worker pool: see docs/JOBS.md.
 """
 
 from __future__ import annotations

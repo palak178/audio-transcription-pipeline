@@ -65,6 +65,12 @@ jobs:
       - name: Lint
         run: python -m ruff check src tests
 
+      # Docs are load-bearing here and split across six files, so a moved section is a real
+      # risk. A dead link renders as a link and survives review, which is exactly why this is
+      # a gate rather than a habit.
+      - name: Check documentation links
+        run: python scripts/check_links.py
+
       - name: Tests
         run: python -m pytest -q
 

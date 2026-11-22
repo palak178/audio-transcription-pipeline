@@ -139,7 +139,7 @@ class Settings(BaseSettings):
     # six hours of audio is rejected rather than decoded.
     max_duration_seconds: float = Field(default=4 * 60 * 60, gt=0)
     # The synchronous HTTP endpoint refuses anything longer and points at the CLI. A documented
-    # limit beats a silent gateway timeout; see docs/DESIGN.md for the asynchronous design.
+    # limit beats a silent gateway timeout; /v1/jobs takes any length. See docs/JOBS.md.
     max_sync_duration_seconds: float = Field(default=600, gt=0)
     max_upload_bytes: int = Field(default=200 * 1024 * 1024, gt=0)
 
@@ -148,7 +148,7 @@ class Settings(BaseSettings):
     # parallel inference: faster-whisper defaults to num_workers=1, so CTranslate2 serializes
     # concurrent transcribe() calls on the shared model, and cpu_threads=0 already lets one
     # request use every core. What a value above 1 buys is overlap between one request's
-    # ffmpeg decode and another's inference. See docs/DESIGN.md for real concurrency.
+    # ffmpeg decode and another's inference. Real concurrency is the worker pool; see docs/JOBS.md.
     max_concurrent_transcriptions: int = Field(default=2, ge=1)
 
 

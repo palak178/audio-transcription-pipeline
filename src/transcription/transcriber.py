@@ -26,7 +26,7 @@ On concurrency: a single :class:`WhisperModel` is created per configuration and 
 is safe but **not parallel**. faster-whisper defaults to ``num_workers=1``, i.e. CTranslate2
 ``inter_threads=1``, so concurrent ``transcribe()`` calls on one model serialize. That is
 close to the right behaviour on CPU anyway, since ``cpu_threads=0`` already lets a single
-request use every core. See docs/DESIGN.md for how real concurrency is reached.
+request use every core. Real concurrency is the worker pool; see docs/JOBS.md.
 """
 
 from __future__ import annotations

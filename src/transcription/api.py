@@ -3,9 +3,9 @@
 Deliberately synchronous, with a documented duration limit.
 
 Transcription takes minutes, which makes a blocking HTTP request the wrong shape for long
-audio. The correct fix is an asynchronous job API, and that requires durable job state,
-retries and a worker tier — production infrastructure that is designed in docs/DESIGN.md
-rather than built here. So rather than half-build a job system, this endpoint:
+audio. The asynchronous job API that fixes it properly is built, in `api_jobs.py` — but it
+needs Postgres, where this endpoint needs nothing. So this one stays, as a genuine convenience
+for short clips rather than as a stand-in, and it:
 
 * transcribes inline and returns the full result, which is the right behaviour for the short
   clips an interactive caller actually sends;
@@ -16,11 +16,11 @@ rather than built here. So rather than half-build a job system, this endpoint:
   ``transcribe()`` calls anyway — and with ``cpu_threads=0`` one request already uses every
   core. The semaphore bounds queue depth and peak memory, and lets one request's ffmpeg
   decode overlap another's inference. It is *not* metering parallel inference, and real
-  parallelism is the worker pool in docs/DESIGN.md;
+  parallelism is the worker pool in docs/JOBS.md;
 * runs the CPU-bound work in a worker thread, so the event loop stays free to serve health
   checks and reject malformed requests while a transcription is in progress.
 
-docs/DESIGN.md describes the asynchronous architecture this would become in production.
+docs/JOBS.md covers the asynchronous tier, which is where long audio belongs.
 """
 
 from __future__ import annotations
@@ -90,7 +90,7 @@ curl -F file=@samples/speech_en.mp3 -F response_format=srt \\
   transcribes correctly; a text file named `.mp3` is rejected with `415`.
 * **This endpoint is synchronous**, so it caps audio length (see `/healthz` for the current
   limit) and returns `413` beyond it. Use the CLI for long files. The asynchronous job API
-  this would become in production is described in `docs/DESIGN.md`.
+  audio of any length belongs on `POST /v1/jobs`; see `docs/JOBS.md`.
 * **Errors are machine-readable.** Every failure returns `{"error": {"code": ..., "message":
   ...}}`; match on `code`, never on the message text.
 * **Results are content-addressed.** The `id` is the SHA-256 of the audio, so uploading the
@@ -491,9 +491,9 @@ def create_app(
                     result: TranscriptionResult = await anyio.to_thread.run_sync(work)
                 except AudioTooLongError as exc:
                     exc.details["hint"] = (
-                        "This endpoint transcribes synchronously. Use the CLI "
-                        "(`transcribe <file>`) for longer audio, or see docs/DESIGN.md for the "
-                        "asynchronous job API this would become in production."
+                        "This endpoint transcribes synchronously. For longer audio use the "
+                        "CLI (`transcribe <file>`), or POST to /v1/jobs, which accepts audio "
+                        "of any length and transcribes it on a worker pool."
                     )
                     raise
 

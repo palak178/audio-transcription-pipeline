@@ -560,6 +560,20 @@ docker run --rm -v "/path/to/your/audio:/data:ro" -v "$PWD/out:/out" \
 
 ---
 
+### What is in the image, and what could come out
+
+The image is ~1.5 GB with the `tiny` model, and `onnxruntime` and `ctranslate2` dominate that
+rather than the weights. It is already built on `python:3.12-slim`. The reductions still
+available, in rough order of payoff: a multi-stage build that discards the pip toolchain,
+installing no dev extras, and shipping the weights in a mounted volume or an init container so
+one image can serve every model size.
+
+ffmpeg and the weights are both baked in deliberately — they are the two things most likely to
+make "works on my machine" true and nowhere else, which is what [Step 4](#step-4-prove-it-needs-no-network)
+above actually proves.
+
+---
+
 ## Troubleshooting
 
 ### Any platform
