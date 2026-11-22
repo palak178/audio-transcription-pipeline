@@ -539,8 +539,8 @@ These are deliberately design rather than code, and DESIGN.md covers each one:
 | Postgres / S3 / durable job state | Audio and transcript storage — designed, not built |
 | Retries, leases, dead-letter queue | Designed, not built — though the *classification* that drives the policy is in `errors.py` (`code`, `retryable`) |
 | Asynchronous job API, webhooks | Designed, not built — the implemented API is synchronous and capped |
+| Speaker diarisation | Designed, not built — [DESIGN.md](docs/DESIGN.md#how-would-you-add-speaker-diarisation) covers the two-stage shape: per-window speaker embeddings, then one global clustering pass, because per-window labels do not correspond. Unbuilt because `pyannote`'s weights are gated and the CPU cost is real (~1.7-2× RTF), and a shaky implementation would be worse than a clear omission |
 | Auth, quotas, rate limits, metrics | Out of scope here; designed in docs/DESIGN.md |
-| Speaker diarisation | Out of scope. `pyannote` adds a gated model and real latency; a shaky implementation would be worse than a clear omission |
 | Parallel transcription of windows | Windows contend for the same cores, and CTranslate2 already parallelises a single request across them. Parallelism belongs *across* files, in the worker pool |
 | Streaming / live transcription | A genuinely different problem (partial hypotheses, revision) and out of scope |
 
@@ -633,6 +633,9 @@ README.md          this file — architecture and design decisions
    The windows are already the natural checkpoint boundary.
 3. **A real accuracy benchmark** — WER against a labelled set such as LibriSpeech, per model
    size, so the model default is an evidence-based choice rather than a reasoned one.
-4. **Speaker diarisation**, the most commonly requested feature this does not have.
+4. **Speaker diarisation**, the most commonly requested feature this does not have — designed
+   in [DESIGN.md](docs/DESIGN.md#how-would-you-add-speaker-diarisation), and deliberately
+   sequenced after the benchmark, because its main tunable cannot be chosen without labelled
+   audio.
 5. **GPU path** — `float16` on CUDA is roughly an order of magnitude faster and changes the
    capacity maths in docs/DESIGN.md considerably.
