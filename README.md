@@ -14,6 +14,13 @@ audio, and results come back as JSON, SRT, WebVTT or plain text. It runs fully o
 with [faster-whisper](https://github.com/SYSTRAN/faster-whisper) — no API key, and the audio
 never leaves the host.
 
+**If you read one section, read [how long audio is handled](#how-do-you-deal-with-long-audio-files).**
+My first design had no chunking at all, on the reasonable grounds that Whisper already slides a
+30-second window across a file of any length. Then I measured peak memory against duration and
+found it growing linearly at ~1.45 MB per second of audio — so a four-hour recording needed
+about 21 GB and would have been killed, under a four-hour limit I had already shipped. That
+section is the measurement, the redesign, and what it did and did not buy.
+
 **Scope, stated up front.** The pipeline is built and tested. The production architecture it
 would need at scale — concurrent uploads, durable storage, retry and recovery, an asynchronous
 job API — is written up as design in [DESIGN.md](docs/DESIGN.md) rather than half-built.

@@ -21,14 +21,14 @@ jobs:
     name: Real-model suite
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install ffmpeg
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ffmpeg
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
@@ -41,7 +41,7 @@ jobs:
       # main affordable. The accuracy assertions in test_integration.py are deliberately
       # loose enough to hold at that size.
       - name: Cache model weights
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/huggingface
           key: hf-tiny-${{ runner.os }}
@@ -53,7 +53,7 @@ jobs:
     name: Container runs with no network
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # The claim worth testing is not that the image builds, but that it needs no network at
       # runtime: ffmpeg and the model weights are both baked in at build time. `--network
