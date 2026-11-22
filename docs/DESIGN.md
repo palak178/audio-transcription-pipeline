@@ -1,10 +1,15 @@
 # Part 2 — Production System Design
 
-> **Nothing in this document is implemented.** It describes the architecture this pipeline would
-> need to run as a real service, and it is deliberately design rather than code. Where the
-> repository already contains a seam the production design would plug into, I point at the file.
-> The boundary is discussed in
+> **Almost nothing in this document is implemented.** It describes the architecture this
+> pipeline would need to run as a real service, and it is deliberately design rather than code.
+> Where the repository already contains a seam the production design would plug into, I point at
+> the file. The boundary is discussed in
 > [README.md](../README.md#what-is-deliberately-not-built).
+>
+> The one exception is **speaker diarisation**, where everything except the model backend is now
+> built and tested — the window grid, the global clustering, the boundary de-duplication, the
+> alignment and the output schema, in `diarisation.py`. That section marks what is code and what
+> is still design.
 
 The single idea the rest of this document follows from:
 
@@ -233,8 +238,22 @@ cost gets caught.
 
 **Diarisation runs as a second pass over the same normalised WAV, after transcription, and its
 labels are attached to the transcript's existing segments rather than resegmenting them.**
-Nothing here is implemented, and one part of it — which backend — is blocked on a licensing
-question rather than an engineering one.
+
+Unlike the rest of this document, most of this section is now code:
+
+| Part | State |
+|---|---|
+| Overlapping window grid, boundary de-duplication | Built — `audio.iter_wav_grid`, `diarisation.window_authority` |
+| Global clustering, speaker hints, short-turn handling | Built — `diarisation._cluster`, `diarisation._label` |
+| Alignment onto transcript segments | Built — `diarisation.assign_speakers` |
+| Output schema and all four exporters | Built — `models.py` at `schema_version` 1.1, `exporters.py` |
+| Retry and partial-success semantics in the pipeline | Built — `pipeline._diarise_stage` |
+| **Segmentation and embedding model** | **Not built.** `Diariser` protocol, no implementation. |
+| Worker tier, queue, backfill job | Design, as with everything else here |
+
+So the honest summary is that the hard, easy-to-get-subtly-wrong parts are done and tested, and
+the part that needs a licensing decision is not. `load_diariser` raises
+`diarisation_unavailable` rather than returning labels nobody should trust.
 
 The constraint that shapes the rest: the pipeline reads audio in windows to bound memory
 (`audio.iter_wav_windows`), so diarisation has to work window by window too. Diarising each
@@ -265,6 +284,7 @@ What it costs:
 |---|---|
 | Global state carried across windows | One 192-float vector per turn ≈ 768 B. A four-hour recording with a turn every 5 s is ~2,900 turns ≈ 2 MB. |
 | Clustering compute | O(n²) cosine distances — ~8M on 192 dimensions, sub-second |
+| Clustering *memory* | O(n²) for the distance matrix: ~34 MB of float32 at 2,900 turns. Transient, and a detail I only noticed on implementing it — it is 17× the embeddings it is computed from, so it is the real memory figure for this stage, not the 2 MB above. |
 | Streaming | Lost. Clustering is a barrier; see the latency section. |
 | Accuracy | Short turns give noisy embeddings, and that is where diarisation error comes from |
 

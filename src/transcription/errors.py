@@ -110,3 +110,38 @@ class TranscriptionFailedError(TranscriptionError):
     code = "transcription_failed"
     http_status = 500
     retryable = True
+
+
+class DiarisationError(TranscriptionError):
+    """Base for diarisation-stage failures.
+
+    Diarisation is a *second stage* over an already-produced transcript, so these are the one
+    family of errors the pipeline does not propagate: it degrades to a transcript with no
+    speaker labels and records the code in ``DiarisationInfo.error_code``. Discarding an
+    expensive transcript because a cheaper downstream stage failed is the wrong trade. See
+    docs/DESIGN.md for why that is a partial success rather than a new job state.
+    """
+
+    code = "diarisation_failed"
+    http_status = 500
+
+
+class DiarisationUnavailableError(DiarisationError):
+    """No diarisation backend is installed, or its weights could not be loaded.
+
+    Permanent, and a deployment problem rather than a caller's — the same family as
+    :class:`FFmpegNotFoundError`. Retrying cannot help. In production the right handling is
+    prevention: gate ``/readyz`` on the diarisation models loading when the feature is
+    enabled, so a misconfigured pod never leases a job instead of failing them one at a time.
+    """
+
+    code = "diarisation_unavailable"
+    http_status = 501
+
+
+class DiarisationFailedError(DiarisationError):
+    """The diarisation model failed while running. Transient, like its transcription twin."""
+
+    code = "diarisation_failed"
+    http_status = 500
+    retryable = True

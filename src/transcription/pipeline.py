@@ -40,9 +40,18 @@ from collections.abc import Callable
 from pathlib import Path
 
 from transcription import audio as audio_module
+from transcription import diarisation as diarisation_module
 from transcription.config import Settings, get_settings
-from transcription.errors import AudioTooLongError
-from transcription.models import AudioInfo, ModelInfo, Segment, TranscriptionResult
+from transcription.diarisation import Diariser, SpeakerHint
+from transcription.errors import AudioTooLongError, DiarisationError
+from transcription.models import (
+    AudioInfo,
+    DiarisationInfo,
+    ModelInfo,
+    Segment,
+    Speaker,
+    TranscriptionResult,
+)
 from transcription.transcriber import FasterWhisperTranscriber, Transcriber
 
 # Called as progress(seconds_transcribed, total_seconds).
@@ -74,6 +83,9 @@ def transcribe_file(
     progress: ProgressCallback | None = None,
     max_duration_seconds: float | None = None,
     display_name: str | None = None,
+    diarise: bool | None = None,
+    diariser: Diariser | None = None,
+    speakers: SpeakerHint | None = None,
 ) -> TranscriptionResult:
     """Transcribe an audio file of any ffmpeg-readable format.
 
@@ -82,19 +94,37 @@ def transcribe_file(
         transcriber: Engine to use. Defaults to faster-whisper per ``settings``.
         settings: Configuration. Defaults to the process-wide settings.
         language: ISO language code to force. ``None`` auto-detects.
-        word_timestamps: Also emit DTW-aligned per-word timings (~10-25% slower).
+        word_timestamps: Also emit DTW-aligned per-word timings (~10-25% slower). Forced on
+            by ``diarise``, because speaker alignment is only as good as the timestamps it
+            aligns against.
         progress: Called after each segment with (seconds_done, total_seconds).
         max_duration_seconds: Duration limit. Defaults to ``settings.max_duration_seconds``.
         display_name: Filename to record in the result, for when ``source`` is a temp file.
+        diarise: Also label who spoke each segment. Defaults to ``settings.diarise``.
+            Estimated at 1.7-2x the compute of a plain transcript, which is why it is opt-in.
+        diariser: Diarisation backend. Defaults to the one named in ``settings``.
+        speakers: What the caller knows about the speaker count. A known count is the
+            cheapest accuracy available here.
 
     Raises:
         TranscriptionError: Any subclass; see :mod:`transcription.errors`.
+
+    A diarisation failure is **not** raised. The transcript is the expensive, primary
+    artefact, so the stage degrades to unlabelled segments and records why in
+    ``result.diarisation``. Check ``result.diarisation.status`` rather than assuming labels.
     """
     settings = settings or get_settings()
     transcriber = transcriber or FasterWhisperTranscriber(settings)
     limit = (
         max_duration_seconds if max_duration_seconds is not None else settings.max_duration_seconds
     )
+    diarise = settings.diarise if diarise is None else diarise
+    # Alignment is only as good as the timestamps underneath it. Whisper's segment edges come
+    # from decoder token positions and drift by a few hundred milliseconds; word edges are DTW
+    # aligned to the audio. At a turn change that drift is exactly what mislabels the words on
+    # either side, so diarisation pays the ~10-25% for word timings rather than silently
+    # aligning against the looser boundaries.
+    word_timestamps = word_timestamps or diarise
 
     source = Path(source)
     info = audio_module.inspect(source)
@@ -164,6 +194,29 @@ def transcribe_file(
         if progress is not None and total:
             progress(total, total)
 
+        # Diarisation is a second pass over the same normalised WAV, inside the same temporary
+        # directory and the same job. That is the reason the two stages stay together: the WAV
+        # is deliberately never stored, so splitting them across workers would mean either
+        # re-running ffmpeg or reversing that decision. See docs/DESIGN.md.
+        #
+        # It runs *after* transcription, not before or alongside. Alongside gains nothing —
+        # both stages are CPU-bound and would contend for the same cores, which is the same
+        # reason windows are not transcribed in parallel. Before would let turn boundaries cut
+        # the transcription windows, which is a genuinely better cut, but it couples the two
+        # passes and makes a diarisation failure cost the transcript.
+        speaker_roster: list[Speaker] | None = None
+        diarisation_info = DiarisationInfo(status="not_requested")
+
+        if diarise:
+            segments, speaker_roster, diarisation_info = _diarise_stage(
+                wav_path,
+                segments=segments,
+                diariser=diariser,
+                settings=settings,
+                audio_duration=info.duration_seconds,
+                speakers=speakers,
+            )
+
     return _build_result(
         info=info,
         meta_language=detected_language,
@@ -173,7 +226,45 @@ def transcribe_file(
         model_name=transcriber.name,
         word_timestamps=word_timestamps,
         processing_seconds=processing_seconds,
+        speakers=speaker_roster,
+        diarisation=diarisation_info,
     )
+
+
+def _diarise_stage(
+    wav_path: Path,
+    *,
+    segments: list[Segment],
+    diariser: Diariser | None,
+    settings: Settings,
+    audio_duration: float,
+    speakers: SpeakerHint | None,
+) -> tuple[list[Segment], list[Speaker] | None, DiarisationInfo]:
+    """Run diarisation and align it, degrading to an unlabelled transcript on failure.
+
+    This is the one error family the pipeline swallows. Everything else — a corrupt file, a
+    failed decode, a model crash — means there is no transcript to return, so there is nothing
+    to do but raise. Here there *is* a transcript, and it is the expensive part; discarding it
+    because a cheaper downstream stage failed is the wrong trade. The failure is recorded with
+    a stable code rather than hidden, and in production the same distinction drives the retry
+    policy: a diarisation stage that exhausts its retries completes the job as a partial
+    success rather than dead-lettering it.
+    """
+    try:
+        backend = diariser or diarisation_module.load_diariser(settings)
+        backend.warm()
+        result = diarisation_module.diarise_wav(
+            wav_path,
+            diariser=backend,
+            settings=settings,
+            audio_duration=audio_duration,
+            hint=speakers,
+        )
+    except DiarisationError as exc:
+        return segments, None, DiarisationInfo(status="failed", error_code=exc.code)
+
+    aligned = diarisation_module.assign_speakers(segments, result.turns)
+    return aligned, result.speakers, result.info
 
 
 def _shift(segment: Segment, offset: float, *, index: int) -> Segment:
@@ -214,6 +305,8 @@ def _build_result(
     model_name: str,
     word_timestamps: bool,
     processing_seconds: float,
+    speakers: list[Speaker] | None = None,
+    diarisation: DiarisationInfo | None = None,
 ) -> TranscriptionResult:
     return TranscriptionResult(
         id=info.sha256,
@@ -229,5 +322,7 @@ def _build_result(
             word_timestamps=word_timestamps,
         ),
         segments=segments,
+        speakers=speakers,
+        diarisation=diarisation,
         processing_seconds=round(processing_seconds, 3),
     )

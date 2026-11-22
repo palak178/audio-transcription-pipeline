@@ -402,6 +402,63 @@ def iter_wav_windows(
         handle.close()
 
 
+def iter_wav_grid(
+    path: Path,
+    *,
+    window_seconds: float,
+    overlap_seconds: float,
+) -> Iterator[tuple[float, np.ndarray]]:
+    """Yield ``(offset_seconds, samples)`` on a **fixed, overlapping** grid.
+
+    This is the diarisation counterpart to :func:`iter_wav_windows`, and it is deliberately a
+    different geometry rather than a reuse of the same one. Transcription wants
+    silence-aligned, non-overlapping windows, because cutting in silence splits no word and
+    leaves nothing to de-duplicate. Diarisation wants the opposite trade: a turn that is cut
+    in half yields two short fragments, and a short fragment gives a speaker embedding close
+    to noise. Overlap is what stops that — any turn shorter than ``overlap_seconds`` is wholly
+    contained in at least one window, and a turn longer than that has enough speech in either
+    fragment to embed reliably.
+
+    The cost is the thing transcription avoided: the same speech is seen twice and produces
+    two turns, so the caller must de-duplicate. :func:`transcription.diarisation.window_authority`
+    is that rule.
+
+    Peak memory is still a function of the window, not of the recording, which is the property
+    that matters.
+    """
+    import numpy as np
+
+    handle = _open_normalized_wav(path)
+    try:
+        rate = handle.getframerate()
+        total_frames = handle.getnframes()
+        window_frames = max(rate, int(window_seconds * rate))
+        # Never overlap more than half the window, which bounds the stride below at half a
+        # window. Without a floor here a misconfigured overlap wider than the window advances
+        # a frame at a time, which on a long file is indistinguishable from a hang — the same
+        # degenerate case iter_wav_windows guards its own search band against. Overlapping
+        # more than you advance is never the intent anyway.
+        overlap_frames = min(max(0, int(overlap_seconds * rate)), window_frames // 2)
+        stride = window_frames - overlap_frames
+
+        position = 0
+        while position < total_frames:
+            handle.setpos(position)
+            raw = handle.readframes(window_frames)
+            if not raw:
+                break
+
+            samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+            yield position / rate, samples
+
+            # Short read means this was the tail of the file.
+            if position + len(samples) >= total_frames:
+                return
+            position += stride
+    finally:
+        handle.close()
+
+
 def probe_duration(path: Path) -> float:
     """Authoritative duration of an already-normalised WAV, in seconds."""
     probe = _ffprobe(path)

@@ -22,7 +22,7 @@ def test_result_carries_the_full_contract(make_audio, fake_transcriber, settings
 
     result = transcribe_file(source, transcriber=fake_transcriber, settings=settings)
 
-    assert result.schema_version == "1.0"
+    assert result.schema_version == "1.1"
     assert len(result.id) == 64  # content hash, stable across runs
     assert result.text == "Hello world. Second segment."
     assert result.language == "en"

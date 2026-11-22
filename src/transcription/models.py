@@ -16,10 +16,11 @@ from __future__ import annotations
 
 import math
 from datetime import UTC, datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field
 
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"
 
 # A complete result, used as the example in the OpenAPI schema so the Swagger page shows
 # callers what to expect before they run anything. Copied verbatim from a real run of
@@ -64,6 +65,9 @@ _RESULT_EXAMPLE = {
             "avg_logprob": -0.2576,
             "confidence": 0.7729,
             "words": None,
+            "speaker": None,
+            "speaker_confidence": None,
+            "speakers_overlap": None,
         },
         {
             "id": 1,
@@ -75,8 +79,22 @@ _RESULT_EXAMPLE = {
             "avg_logprob": -0.2576,
             "confidence": 0.7729,
             "words": None,
+            "speaker": None,
+            "speaker_confidence": None,
+            "speakers_overlap": None,
         },
     ],
+    "speakers": None,
+    "diarisation": {
+        "status": "not_requested",
+        "backend": None,
+        "speaker_count": None,
+        "speakers_hint": None,
+        "clustering_threshold": None,
+        "overlap_seconds": None,
+        "processing_seconds": None,
+        "error_code": None,
+    },
     "text": (
         "quick brown fox jumps over the lazy dog. This recording is a test fixture for the "
         "audio transcription service."
@@ -94,6 +112,15 @@ class Word(BaseModel):
     word: str = Field(description="The word, including any leading space.", examples=[" brown"])
     probability: float | None = Field(
         default=None, description="Model confidence for this word, 0-1.", examples=[0.9722]
+    )
+    speaker: str | None = Field(
+        default=None,
+        description=(
+            "Speaker label, when diarisation ran. Word-level assignment is sharper than "
+            "segment-level because word timings are DTW-aligned to the audio rather than "
+            "derived from decoder token positions."
+        ),
+        examples=["SPEAKER_00"],
     )
 
 
@@ -132,6 +159,36 @@ class Segment(BaseModel):
     words: list[Word] | None = Field(
         default=None,
         description="Per-word timings. Only populated when `word_timestamps` is requested.",
+    )
+    speaker: str | None = Field(
+        default=None,
+        description=(
+            "Who spoke this segment, when diarisation ran. An opaque label: `SPEAKER_00` is "
+            "the first voice heard in *this* recording and means nothing across recordings. "
+            "`null` means diarisation did not run, or ran and found no speech here — "
+            "`diarisation.status` on the result disambiguates."
+        ),
+        examples=["SPEAKER_00"],
+    )
+    speaker_confidence: float | None = Field(
+        default=None,
+        description=(
+            "The winning speaker's share of this segment, 0-1. Speaker turns and transcript "
+            "segments are independent segmentations of the same timeline, so they disagree at "
+            "the edges; a low value means this segment straddles a turn change and the label "
+            "is a majority vote rather than a clean answer. A ranking signal for routing to "
+            "review, like `confidence` — not a calibrated probability."
+        ),
+        examples=[1.0],
+    )
+    speakers_overlap: bool | None = Field(
+        default=None,
+        description=(
+            "The backend detected more than one person speaking at once somewhere in this "
+            "span. The text is *not* separated by speaker: Whisper transcribes a mixed "
+            "waveform into one token stream, so attribution here is unreliable by "
+            "construction. Flagged rather than resolved."
+        ),
     )
 
     @computed_field  # type: ignore[prop-decorator]
@@ -181,6 +238,77 @@ class AudioInfo(BaseModel):
     bit_rate: int | None = Field(default=None, description="Source bit rate.", examples=[48000])
 
 
+class Speaker(BaseModel):
+    """One voice found in one recording.
+
+    ``id`` is a string rather than an int on purpose. ``"SPEAKER_00"`` reads as the opaque
+    label it is, where ``0`` invites a consumer to sort or do arithmetic on something that
+    carries no order at all. It also leaves room for a real name later, if speaker enrolment
+    is ever built, without a type change.
+    """
+
+    id: str = Field(
+        description="Opaque label, numbered by first appearance in this recording.",
+        examples=["SPEAKER_00"],
+    )
+    total_speech_seconds: float = Field(
+        description="How long this speaker spoke in total.", examples=[42.5]
+    )
+    turn_count: int = Field(description="How many separate turns they took.", examples=[7])
+
+
+class DiarisationInfo(BaseModel):
+    """Diarisation provenance, for the same reason :class:`ModelInfo` exists.
+
+    A consumer needs to be able to tell which backend and which clustering threshold produced
+    a set of labels, because both change the answer and neither is visible in the labels
+    themselves.
+    """
+
+    status: Literal["not_requested", "succeeded", "failed"] = Field(
+        description=(
+            "`failed` still comes back on a `200`: diarisation is a second stage over an "
+            "already-finished transcript, and losing the transcript because the cheaper stage "
+            "failed is the wrong trade."
+        ),
+        examples=["succeeded"],
+    )
+    backend: str | None = Field(
+        default=None, description="Which diarisation engine ran.", examples=["pyannote-3.1"]
+    )
+    speaker_count: int | None = Field(
+        default=None, description="How many distinct speakers were found.", examples=[2]
+    )
+    speakers_hint: int | None = Field(
+        default=None,
+        description="Speaker count the caller supplied, if any. Constrains the clustering.",
+    )
+    clustering_threshold: float | None = Field(
+        default=None,
+        description="Cosine distance at which clustering stopped merging.",
+        examples=[0.55],
+    )
+    overlap_seconds: float | None = Field(
+        default=None,
+        description="Total audio where more than one person was speaking at once.",
+        examples=[0.0],
+    )
+    processing_seconds: float | None = Field(
+        default=None,
+        description=(
+            "Diarisation time only. Deliberately separate from the result's "
+            "`processing_seconds`, so that figure keeps meaning transcription inference and "
+            "stays comparable with runs that did not diarise."
+        ),
+        examples=[12.4],
+    )
+    error_code: str | None = Field(
+        default=None,
+        description="Stable error code when `status` is `failed`. Match on this.",
+        examples=["diarisation_unavailable"],
+    )
+
+
 class ModelInfo(BaseModel):
     """Provenance: enough to reproduce this exact run."""
 
@@ -223,11 +351,20 @@ class TranscriptionResult(BaseModel):
     segments: list[Segment] = Field(
         description="Timestamped segments, in order. Empty when the audio contains no speech."
     )
+    speakers: list[Speaker] | None = Field(
+        default=None,
+        description="Roster of voices found, when diarisation ran. `null` when it did not.",
+    )
+    diarisation: DiarisationInfo | None = Field(
+        default=None,
+        description="Diarisation provenance and outcome. `null` on results predating 1.1.",
+    )
 
     processing_seconds: float = Field(
         description=(
-            "Inference seconds only: excludes ffmpeg normalisation and the one-off model "
-            "load, so the figure is comparable across runs."
+            "Transcription inference seconds only: excludes ffmpeg normalisation, the one-off "
+            "model load, and diarisation, so the figure is comparable across runs. "
+            "Diarisation time is reported separately in `diarisation.processing_seconds`."
         ),
         examples=[0.686],
     )

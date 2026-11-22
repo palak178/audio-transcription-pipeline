@@ -170,16 +170,16 @@ Expected — a progress bar and summary on stderr, JSON on stdout:
 ```
 Transcribing samples/speech_en.mp3 with model `base`...
   [#########################] 100.0%
-  2 segments | 7.2s audio | 0.6s compute | RTF 0.09 | language en (100%)
+  2 segments | 7.2s audio | 0.6s compute | RTF 0.08 | language en (100%)
 {
-  "schema_version": "1.0",
+  "schema_version": "1.1",
   "id": "33b72396207f5be6...",
   "language": "en",
   ...
 }
 ```
 
-**If you see that, the whole pipeline works.** `RTF 0.09` means roughly eleven times faster
+**If you see that, the whole pipeline works.** `RTF 0.08` means roughly twelve times faster
 than real time, on CPU.
 
 ### Command equivalents on Windows
@@ -422,7 +422,7 @@ make test            # macOS / Linux
 python -m pytest     # any platform
 ```
 
-Expected: **130 passed** in a few seconds. No model weights needed — the engine is faked,
+Expected: **162 passed** in a few seconds. No model weights needed — the engine is faked,
 while ffmpeg, the pipeline, the windowing and the real ASGI stack are all exercised for real.
 
 ### The full suite

@@ -49,6 +49,35 @@ class Settings(BaseSettings):
     # land in silence instead of through the middle of a word.
     window_search_seconds: float = Field(default=15.0, gt=0)
 
+    # --- Diarisation ----------------------------------------------------------------------
+    # Off by default, and opt-in per job rather than always on. Diarisation is estimated at
+    # 1.7-2x the compute of a plain transcript, which roughly doubles a worker fleet for a
+    # feature a minority of jobs want. The precedent is `word_timestamps`, opt-in for the same
+    # reason at a fifth of the cost. See docs/DESIGN.md.
+    diarise: bool = False
+    # Which backend to load. No backend ships with this repository yet: `pyannote`'s weights
+    # are gated on Hugging Face, which would break the offline, token-free, three-command
+    # setup this project guarantees. The clustering, de-duplication and alignment around the
+    # backend are implemented and tested; the embedding model is the missing piece.
+    diarisation_backend: str = "none"
+    # Diarisation reads the audio on its own fixed, overlapping grid rather than reusing the
+    # silence-aligned transcription windows. See audio.iter_wav_grid for why.
+    diarisation_window_seconds: float = Field(default=120.0, gt=0)
+    # Any turn shorter than this is wholly contained in at least one window, so it is never
+    # split into two fragments too short to embed.
+    diarisation_overlap_seconds: float = Field(default=15.0, ge=0)
+    # Cosine distance at which agglomerative clustering stops merging. This is *the* tunable,
+    # and it is an unvalidated placeholder: choosing it honestly needs labelled audio this
+    # repository does not have, which is why the accuracy benchmark is sequenced ahead of
+    # diarisation in docs/DESIGN.md. Erring low over-splits one speaker into two, which a
+    # human can merge in review; erring high merges two speakers, which nobody can undo
+    # without re-running the job.
+    diarisation_threshold: float = Field(default=0.55, gt=0, le=2.0)
+    # Turns shorter than this are excluded from clustering and labelled from their temporal
+    # neighbours instead. An embedding from 600 ms of speech is close to noise, and letting it
+    # vote drags a cluster; inheriting a neighbour's label is wrong only locally.
+    diarisation_min_embedding_seconds: float = Field(default=1.0, gt=0)
+
     # --- Limits ---------------------------------------------------------------------------
     # Checked against the *probed* duration before decoding, so a 1 MB file that expands to
     # six hours of audio is rejected rather than decoded.

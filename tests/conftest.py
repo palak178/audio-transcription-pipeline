@@ -17,6 +17,7 @@ import shutil
 import subprocess
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 from fastapi.testclient import TestClient
@@ -25,6 +26,11 @@ from transcription.api import create_app
 from transcription.config import Settings
 from transcription.models import Segment
 from transcription.transcriber import TranscribeMeta
+
+if TYPE_CHECKING:
+    import numpy as np
+
+    from transcription.diarisation import RawTurn
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SPEECH_SAMPLE = PROJECT_ROOT / "samples" / "speech_en.mp3"
@@ -148,6 +154,59 @@ class FakeTranscriber:
 @pytest.fixture
 def fake_transcriber() -> FakeTranscriber:
     return FakeTranscriber()
+
+
+class FakeDiariser:
+    """Deterministic stand-in for a diarisation backend.
+
+    Exists for the same reason ``FakeTranscriber`` does, and it is doing more work than it
+    looks: no real diarisation backend ships with this repository, so the fake is what puts
+    the parts that *are* implemented — the overlapping window grid, the global clustering, the
+    midpoint de-duplication rule and the alignment onto segments — genuinely under test.
+
+    ``turns_per_window`` is called with the window index and the samples, and returns
+    window-relative turns. Driving it per window is the point: a backend that returns the same
+    turns for every window is exactly how you catch a de-duplication bug.
+    """
+
+    def __init__(
+        self,
+        turns_per_window: Callable[[int, object], list[RawTurn]] | None = None,
+        *,
+        name: str = "fake-diariser",
+        error: Exception | None = None,
+    ) -> None:
+        self._turns_per_window = turns_per_window or (lambda index, samples: [])
+        self._name = name
+        self._error = error
+        self.window_count = 0
+        self.warm_calls = 0
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def warm(self) -> None:
+        self.warm_calls += 1
+
+    def segment(self, samples) -> list[RawTurn]:
+        if self._error is not None:
+            raise self._error
+        index = self.window_count
+        self.window_count += 1
+        return self._turns_per_window(index, samples)
+
+
+def embedding(*values: float) -> np.ndarray:
+    """A tiny speaker embedding.
+
+    Two dimensions rather than 192 because nothing in the clustering depends on the
+    dimension, and a 2-D vector is one a reader can reason about: ``embedding(1, 0)`` and
+    ``embedding(0, 1)`` are a cosine distance of exactly 1.0 apart.
+    """
+    import numpy as np
+
+    return np.array(values, dtype=np.float32)
 
 
 @pytest.fixture

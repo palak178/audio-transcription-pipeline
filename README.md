@@ -30,7 +30,7 @@ brew install ffmpeg                    # macOS
 make setup      # virtualenv + install (needs uv — plain-pip path below)
 make warm       # downloads the model once (74 MB) — do it now, not mid-demo
 make demo       # transcribes the committed sample, prints JSON and SRT
-make test       # 130 tests, ~3 s, no model weights needed
+make test       # 162 tests, ~4 s, no model weights needed
 ```
 
 <details>
@@ -336,29 +336,46 @@ The JSON is the contract for downstream consumers — designed to be depended on
 
 ```json
 {
-  "schema_version": "1.0",
+  "schema_version": "1.1",
   "id": "33b72396207f5be6...",           // SHA-256 of the source bytes
-  "created_at": "2026-10-24T16:55:06.273840Z",
+  "created_at": "2026-11-22T10:22:27.590985Z",
   "language": "en", "language_probability": 0.9973,
   "audio":  { "filename": "speech_en.mp3", "codec": "mp3", "duration_seconds": 7.245,
               "sample_rate": 22050, "channels": 1, "size_bytes": 44111, "sha256": "33b7..." },
   "model":  { "name": "base", "device": "cpu", "compute_type": "int8",
               "beam_size": 5, "vad_filter": true, "word_timestamps": false },
   "segments": [ /* ... */ ],
+  "speakers": null,
+  "diarisation": { "status": "not_requested", "backend": null, "speaker_count": null,
+                   "speakers_hint": null, "clustering_threshold": null,
+                   "overlap_seconds": null, "processing_seconds": null, "error_code": null },
   "text": "quick brown fox jumps over the lazy dog. This recording is a test fixture ...",
-  "processing_seconds": 0.686,
-  "real_time_factor": 0.0947
+  "processing_seconds": 0.613,
+  "real_time_factor": 0.0846
 }
 ```
 
-- `schema_version` lets the format evolve without breaking consumers.
+- `schema_version` lets the format evolve without breaking consumers. It is at **1.1** because
+  `speakers`, `diarisation` and three per-segment speaker fields were added; every one is
+  optional and defaults to `null`, so a 1.0 consumer that ignores unknown keys is unaffected.
+  Breaking changes would move the API path to `/v2`, not this number.
 - `id` is the **content hash**, so the same audio always yields the same identifier. One line
   of code that buys de-duplication, caching and safe retries — and it is the hook the
   production design in docs/DESIGN.md hangs idempotency on.
 - `model` is provenance: enough to reproduce the run, and to tell *which* model produced a
-  transcript when you later upgrade.
-- `real_time_factor` is inference seconds per audio second. It excludes ffmpeg normalisation
-  and the one-off model load, so it is comparable across runs.
+  transcript when you later upgrade. `diarisation` is the same idea for speaker labels: the
+  backend and the clustering threshold both change the answer and neither is visible in the
+  labels themselves.
+- `real_time_factor` is inference seconds per audio second. It excludes ffmpeg normalisation,
+  the one-off model load, and diarisation, so it is comparable across runs — diarisation
+  reports its own time in `diarisation.processing_seconds`.
+
+Each segment gains `speaker`, `speaker_confidence` and `speakers_overlap`. They are `null`
+here because this run did not diarise; `diarisation.status` is what distinguishes "not asked
+for" from "asked for and failed". `speaker_confidence` is the winning speaker's share of the
+segment, so a low value means the segment straddles a turn change and the label is a majority
+vote rather than a clean answer — the same kind of signal as `confidence`, and not a
+calibrated probability either.
 
 Over HTTP the same timing also comes back as a header, because `srt`/`vtt`/`txt` have no body
 field to carry it and because a caller debugging a *slow rejection* needs the number too:
@@ -502,23 +519,34 @@ request.
 ## Testing
 
 ```bash
-make test        # 130 tests, ~3 s, no model weights required
+make test        # 162 tests, ~4 s, no model weights required
 make test-all    # adds 10 real-model integration tests
 make lint
 ```
 
-The strategy follows from the `Transcriber` protocol: **inference is the only slow,
+The strategy follows from the `Transcriber` protocol: **model inference is the only slow,
 non-deterministic part of the system, so that is the only thing faked.** The fast suite runs
 the real pipeline, real ffmpeg subprocesses and the real ASGI stack against a `FakeTranscriber`
 — so format handling, windowing, stitching, exporting, error mapping and HTTP behaviour are all
-genuinely under test, with no model download.
+genuinely under test, with no model download. `FakeDiariser` does the same job for the
+`Diariser` protocol, and there it is carrying more weight than a convenience: no diarisation
+model ships here, so the fake is the only thing putting the window grid, the clustering, the
+de-duplication and the alignment under test at all.
 
-Two tests are worth singling out because they pin down claims that are easy to assert and hard
-to keep true: `test_windows_tile_the_audio_exactly` checks that windows cover the audio with no
-gaps and no overlaps, which is the invariant that makes rebasing timestamps by a plain offset
-*provably* correct rather than approximately correct; and
-`test_oversized_upload_is_rejected_before_the_body_is_read` makes any read of the upload fail,
-so a clean `413` proves the rejection really did happen in middleware.
+Four tests are worth singling out, because they pin down claims that are easy to assert and
+hard to keep true:
+
+- `test_windows_tile_the_audio_exactly` — windows cover the audio with no gaps and no
+  overlaps, which is the invariant that makes rebasing timestamps by a plain offset *provably*
+  correct rather than approximately correct.
+- `test_oversized_upload_is_rejected_before_the_body_is_read` — makes any read of the upload
+  fail, so a clean `413` proves the rejection really happened in middleware.
+- `test_the_same_voice_in_different_windows_gets_one_label` — the same speaker, heard in two
+  different windows, comes back with one label. This is the entire reason diarisation clusters
+  embeddings globally instead of labelling each window.
+- `test_output_is_unchanged_when_nothing_is_diarised` — SRT, WebVTT and text output stay byte
+  for byte what they were before speaker labels existed, which is the difference between an
+  additive feature and a silent break for every caption consumer.
 
 The `slow` suite then covers what a fake cannot: a real model, real word alignment, real
 behaviour on silence, and a long file crossing real window boundaries.
@@ -539,7 +567,7 @@ These are deliberately design rather than code, and DESIGN.md covers each one:
 | Postgres / S3 / durable job state | Audio and transcript storage — designed, not built |
 | Retries, leases, dead-letter queue | Designed, not built — though the *classification* that drives the policy is in `errors.py` (`code`, `retryable`) |
 | Asynchronous job API, webhooks | Designed, not built — the implemented API is synchronous and capped |
-| Speaker diarisation | Designed, not built — [DESIGN.md](docs/DESIGN.md#how-would-you-add-speaker-diarisation) covers the two-stage shape: per-window speaker embeddings, then one global clustering pass, because per-window labels do not correspond. Unbuilt because `pyannote`'s weights are gated and the CPU cost is real (~1.7-2× RTF), and a shaky implementation would be worse than a clear omission |
+| Speaker diarisation — **the model backend only** | Everything around the model is built and tested: the overlapping window grid, the global clustering that makes labels mean the same thing across windows, boundary de-duplication, alignment onto segments, the schema and all four exporters (`diarisation.py`). The segmentation and embedding model is not, because `pyannote`'s weights are gated behind a Hugging Face licence and requiring one would break the offline, token-free setup above. Asking for diarisation returns `diarisation.status: failed` with `diarisation_unavailable` — a clear omission rather than a shaky implementation. [DESIGN.md](docs/DESIGN.md#how-would-you-add-speaker-diarisation) has the full design and the part-by-part state |
 | Auth, quotas, rate limits, metrics | Out of scope here; designed in docs/DESIGN.md |
 | Parallel transcription of windows | Windows contend for the same cores, and CTranslate2 already parallelises a single request across them. Parallelism belongs *across* files, in the worker pool |
 | Streaming / live transcription | A genuinely different problem (partial hypotheses, revision) and out of scope |
@@ -566,6 +594,12 @@ Every setting is an environment variable prefixed `TRANSCRIBE_`; see
 | `TRANSCRIBE_MAX_UPLOAD_BYTES` | `209715200` | 200 MB |
 | `TRANSCRIBE_MAX_CONCURRENT_TRANSCRIPTIONS` | `2` | In-flight inference limit |
 | `TRANSCRIBE_VAD_FILTER` | `true` | Leave on |
+| `TRANSCRIBE_DIARISE` | `false` | Label who spoke. Needs a backend; see the row above |
+| `TRANSCRIBE_DIARISATION_BACKEND` | `none` | No backend ships yet, so this is the only value |
+| `TRANSCRIBE_DIARISATION_WINDOW_SECONDS` | `120` | Diarisation's own window, separate from transcription's |
+| `TRANSCRIBE_DIARISATION_OVERLAP_SECONDS` | `15` | Overlap, so no turn is split into two unembeddable halves |
+| `TRANSCRIBE_DIARISATION_THRESHOLD` | `0.55` | Cosine distance to stop merging speakers. **An unvalidated placeholder** — picking it honestly needs labelled audio |
+| `TRANSCRIBE_DIARISATION_MIN_EMBEDDING_SECONDS` | `1.0` | Shorter turns are labelled from neighbours, not clustered |
 
 ### Docker
 
@@ -610,6 +644,7 @@ src/transcription/
   audio.py         ffprobe inspection, ffmpeg normalisation, windowed WAV reading
   transcriber.py   Transcriber protocol + faster-whisper backend
   models.py        the output contract (versioned pydantic schema)
+  diarisation.py   speaker turns: window grid, global clustering, alignment (no model yet)
   exporters.py     json / srt / vtt / txt
   pipeline.py      orchestration, windowing, stitching, progress
   cli.py           transcribe / inspect / warm
@@ -617,7 +652,7 @@ src/transcription/
 docs/
   DESIGN.md        production architecture (design only, nothing implemented)
   RUNNING.md       step-by-step setup, every command to try, troubleshooting
-tests/             130 fast + 10 slow
+tests/             162 fast + 10 slow
 scripts/           make_fixtures.sh
 samples/           one committed 43 KB recording
 README.md          this file — architecture and design decisions
@@ -633,9 +668,10 @@ README.md          this file — architecture and design decisions
    The windows are already the natural checkpoint boundary.
 3. **A real accuracy benchmark** — WER against a labelled set such as LibriSpeech, per model
    size, so the model default is an evidence-based choice rather than a reasoned one.
-4. **Speaker diarisation**, the most commonly requested feature this does not have — designed
-   in [DESIGN.md](docs/DESIGN.md#how-would-you-add-speaker-diarisation), and deliberately
-   sequenced after the benchmark, because its main tunable cannot be chosen without labelled
-   audio.
+4. **A speaker diarisation backend.** Everything around the model is already built and tested
+   in `diarisation.py` — [DESIGN.md](docs/DESIGN.md#how-would-you-add-speaker-diarisation) has
+   the part-by-part state. What is left is the segmentation and embedding model itself, and it
+   sits behind item 3 on purpose: its one load-bearing tunable, the clustering threshold,
+   cannot be chosen honestly without labelled audio.
 5. **GPU path** — `float16` on CUDA is roughly an order of magnitude faster and changes the
    capacity maths in docs/DESIGN.md considerably.

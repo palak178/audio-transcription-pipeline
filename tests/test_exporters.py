@@ -114,7 +114,7 @@ def test_vtt_has_required_header(result: TranscriptionResult) -> None:
 def test_json_carries_the_downstream_contract(result: TranscriptionResult) -> None:
     payload = json.loads(exporters.to_json(result))
 
-    assert payload["schema_version"] == "1.0"
+    assert payload["schema_version"] == "1.1"
     assert payload["id"] == "a" * 64
     assert payload["text"] == "Hello world. Second line."
     assert payload["real_time_factor"] == 0.25

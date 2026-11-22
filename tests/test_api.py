@@ -48,7 +48,7 @@ def test_returns_timestamped_segments(client: TestClient, make_audio) -> None:
 
     assert response.status_code == 200
     body = response.json()
-    assert body["schema_version"] == "1.0"
+    assert body["schema_version"] == "1.1"
     assert body["text"] == "Hello world. Second segment."
     assert body["audio"]["filename"] == "clip.mp3"
     assert body["audio"]["codec"] == "mp3"
@@ -419,7 +419,7 @@ def test_openapi_includes_a_full_result_example(client: TestClient) -> None:
     schemas = client.get("/openapi.json").json()["components"]["schemas"]
     example = schemas["TranscriptionResult"]["example"]
 
-    assert example["schema_version"] == "1.0"
+    assert example["schema_version"] == "1.1"
     assert example["segments"][0]["text"]
     assert "real_time_factor" in example
 
