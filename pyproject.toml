@@ -52,6 +52,14 @@ s3 = [
     "boto3>=1.35.0",
 ]
 
+# The speaker-diarisation backend. Optional because the default install stays small and fully
+# offline, and because diarisation is opt-in per job anyway. Provides correct Kaldi-compatible
+# fbank features and the ONNX runtime wiring for the speaker-embedding model, which is the part
+# worth not hand-rolling.
+diarise = [
+    "sherpa-onnx>=1.10",
+]
+
 [project.scripts]
 transcribe = "transcription.cli:main"
 

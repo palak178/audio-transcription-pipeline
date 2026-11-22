@@ -443,6 +443,49 @@ request.
 
 ---
 
+### Diarisation
+
+Measured on a 212 s synthetic multi-speaker fixture, CPU only, with the CAM++ backend:
+
+| Run | Whisper RTF | Diarisation RTF | Total | vs plain |
+|---|---|---|---|---|
+| plain | 0.0390 | — | 0.0390 | 1.00x |
+| `--word-timestamps` | 0.0419 | — | 0.0419 | 1.07x |
+| `--diarise` | 0.0442 | 0.0082 | 0.0524 | **1.34x** |
+
+The diarisation pass costs about **0.8% of real time**, which is more than an order of
+magnitude less than [DESIGN.md](DESIGN.md) estimated before it was built. Embedding runs once
+per ~1.5 s sub-segment of *speech*, not continuously over the audio, so the work is a few
+hundred small forward passes rather than a second transcription-shaped load.
+
+Accuracy, scored as diarisation error rate with the standard 250 ms collar and the optimal
+mapping of generated labels onto reference ones:
+
+| Fixture | Speakers found | DER |
+|---|---|---|
+| 2 speakers, 0.5 s gaps | 2 / 2 | 0.00% |
+| 3 speakers | 3 / 3 | 0.00% |
+| 5 speakers | 5 / 5 | 0.00% |
+| 2 speakers, same gender and different accents | 2 / 2 | 0.00% |
+| 2 speakers, **no silence between turns** | 2 / 2 | **3.75%** |
+
+The last row is the honest one, and it is the predicted weakness showing through. There is no
+neural speaker-change detector in this backend, so turn boundaries land on the sub-segment grid;
+when turns butt straight up against each other, the piece straddling the change gets one label
+and about 4% of frames are wrong. Put half a second of silence between speakers and it
+disappears.
+
+**What these numbers are not.** Synthetic voices sit about 0.84 cosine distance apart, where
+two real people of one gender and accent sit far closer — so 0.00% here means the pipeline is
+correct, not that it is accurate on a real meeting. Reproduce, or point it at a real corpus:
+
+```bash
+python scripts/make_speaker_fixture.py out/two --speakers 2 --turns 6 --gap 0.5
+python scripts/evaluate_diarisation.py out/two.wav out/two.rttm
+```
+
+---
+
 ## Edge cases handled
 
 | Case | Behaviour |

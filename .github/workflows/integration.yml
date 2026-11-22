@@ -130,3 +130,46 @@ jobs:
       - name: Tear down
         if: always()
         run: docker compose down --volumes
+
+  # The diarisation accuracy tests need macOS `say` to build audio whose ground truth is known
+  # by construction, so this is the only runner where they can actually run rather than skip.
+  # It is the only job here that measures a model's output quality rather than that code works.
+  diarisation:
+    name: Diarisation accuracy (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install ffmpeg
+        run: brew install ffmpeg
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install with the diarisation extra
+        run: python -m pip install -e ".[dev,diarise]"
+
+      - name: Cache models
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/huggingface
+            ~/.cache/transcription
+          key: diarise-models-${{ runner.os }}
+
+      - name: Fetch the speaker model
+        run: python -m transcription.cli diarise-warm
+
+      # Scored against ground truth, so a regression in clustering, VAD, sub-segmentation or
+      # alignment fails here rather than being noticed later by a user.
+      - name: Diarisation tests, including diarisation error rate
+        run: python -m pytest tests/test_diarisation_onnx.py -m slow -q
+
+      - name: Report DER on the documented fixtures
+        run: |
+          python scripts/make_speaker_fixture.py out/two --speakers 2 --turns 6 --gap 0.5
+          TRANSCRIBE_DIARISATION_BACKEND=onnx \
+            python scripts/evaluate_diarisation.py out/two.wav out/two.rttm

@@ -18,7 +18,11 @@ Every setting is an environment variable prefixed `TRANSCRIBE_`; see
 | `TRANSCRIBE_MAX_CONCURRENT_TRANSCRIPTIONS` | `2` | In-flight inference limit |
 | `TRANSCRIBE_VAD_FILTER` | `true` | Leave on |
 | `TRANSCRIBE_DIARISE` | `false` | Label who spoke. Needs a backend; see the row above |
-| `TRANSCRIBE_DIARISATION_BACKEND` | `none` | No backend ships yet, so this is the only value |
+| `TRANSCRIBE_DIARISATION_BACKEND` | `none` | `none` or `onnx`. Needs `pip install -e ".[diarise]"` and `transcribe diarise-warm` |
+| `TRANSCRIBE_DIARISATION_MODEL_PATH` | — | Where the speaker-embedding model lives. Defaults beside the Whisper weights |
+| `TRANSCRIBE_DIARISATION_SUBSEGMENT_SECONDS` | `1.5` | Boundary resolution. The backend's main weakness: no neural speaker-change detection, so turns land on this grid |
+| `TRANSCRIBE_DIARISATION_MERGE_GAP_SECONDS` | `0.75` | Adjacent same-speaker turns closer than this merge back into one |
+| `TRANSCRIBE_DIARISATION_THREADS` | `2` | ONNX threads for embedding |
 | `TRANSCRIBE_DIARISATION_WINDOW_SECONDS` | `120` | Diarisation's own window, separate from transcription's |
 | `TRANSCRIBE_DIARISATION_OVERLAP_SECONDS` | `15` | Overlap, so no turn is split into two unembeddable halves |
 | `TRANSCRIBE_DIARISATION_THRESHOLD` | `0.55` | Cosine distance to stop merging speakers. **An unvalidated placeholder** — picking it honestly needs labelled audio |

@@ -9,14 +9,15 @@
 > | Concurrent uploads | Design. The worker tier that makes it real is built. |
 > | Storing audio and transcripts | **Built** — `blobstore.py`, filesystem and S3 backends |
 > | Retry and recovery | **Built** — `jobstore.py`, `checkpoint.py`, `worker.py` |
-> | Speaker diarisation | **Built except the model backend** — `diarisation.py` |
+> | Speaker diarisation | **Built** — `diarisation.py` plus an ungated ONNX backend |
 > | Exposing this as an API | **Built** — `api_jobs.py`, at `/v1/jobs` |
 > | Auth | **Built** — `auth.py`, per-tenant API keys |
 > | Quotas, rate limits, webhooks | Design |
 >
-> Three places where building it corrected the design, each marked in context below: the queue
-> is Postgres rather than SQS, idempotency needed more than `(tenant, audio, model)`, and
-> clustering's real memory cost is the distance matrix rather than the embeddings.
+> Four places where building it corrected the design, each marked in context below: the queue is
+> Postgres rather than SQS, idempotency needed more than `(tenant, audio, model)`, clustering's
+> real memory cost is the distance matrix rather than the embeddings, and diarisation's compute
+> cost was overestimated by more than an order of magnitude.
 
 The single idea the rest of this document follows from:
 
@@ -286,12 +287,14 @@ Unlike the rest of this document, most of this section is now code:
 | Alignment onto transcript segments | Built — `diarisation.assign_speakers` |
 | Output schema and all four exporters | Built — `models.py` at `schema_version` 1.1, `exporters.py` |
 | Retry and partial-success semantics in the pipeline | Built — `pipeline._diarise_stage` |
-| **Segmentation and embedding model** | **Not built.** `Diariser` protocol, no implementation. |
+| Segmentation and embedding model | **Built** — `diarisation_onnx.py`: Silero VAD, fixed sub-segmentation, CAM++ embeddings. Ungated. |
+| Ground-truth evaluation | **Built** — `scripts/make_speaker_fixture.py` and `scripts/evaluate_diarisation.py` (DER with collar and optimal label mapping) |
 | Worker tier, queue, backfill job | Design, as with everything else here |
 
-So the honest summary is that the hard, easy-to-get-subtly-wrong parts are done and tested, and
-the part that needs a licensing decision is not. `load_diariser` raises
-`diarisation_unavailable` rather than returning labels nobody should trust.
+The licensing problem was solved by not using `pyannote`. The weights now come from the
+sherpa-onnx release assets — a plain download, no account, no token — at the cost of accuracy
+and of overlap detection. `load_diariser` still raises `diarisation_unavailable` when the
+backend is off or the model is absent, rather than returning labels nobody should trust.
 
 The constraint that shapes the rest: the pipeline reads audio in windows to bound memory
 (`audio.iter_wav_windows`), so diarisation has to work window by window too. Diarising each
@@ -397,6 +400,13 @@ feature meant to be purely additive, so it belongs behind a `schema_version` 2.0
 
 ### Gated model access
 
+> **Resolved, and not by resolving the licensing question.** `pyannote` is still gated and
+> still unused. The shipped backend takes its weights from the sherpa-onnx release assets
+> instead: ungated, 28 MB, fetched by `transcribe diarise-warm` with a pinned SHA-256. The
+> trade is real — no neural speaker-change detection, so turn boundaries land on a ~1.5 s grid,
+> and **no overlap detection at all**. Both are documented in `diarisation_onnx.py` rather than
+> discovered. The three-command setup survives, which was the property worth protecting.
+
 **`pyannote` is the accurate option and it cannot be the default here.**
 
 The facts. `pyannote/speaker-diarization-3.1`, and the segmentation and embedding checkpoints
@@ -433,40 +443,46 @@ of this project, and an accuracy gain does not outweigh quietly breaking it.
 
 ### Latency and cost: opt-in per job
 
-**Opt-in, `diarise: false` by default.**
+**Opt-in, `diarise: false` by default.** That decision stands. The reasoning behind it did not
+survive measurement.
 
-First, honesty about the numbers. I have not measured any of this. Every performance figure in
-this repository comes from a real run, so what follows is a planning budget and is flagged as
-one. Measuring the real RTF is a prerequisite to building this, not a follow-up to it.
+> **Measured, and the estimate below was badly wrong.** This section originally budgeted the
+> diarisation pass at RTF 0.08-0.20 and the total overhead at 1.7-2x. Measured on a 212 s
+> synthetic multi-speaker fixture with the CAM++ backend:
+>
+> | Stage | Estimated | **Measured** |
+> |---|---|---|
+> | Whisper alone | 0.27 (dense speech) | 0.0390 (this fixture) |
+> | + word timestamps | +10-25% | **+7.4%** |
+> | + the diarisation pass | 0.10-0.25 | **0.0082** |
+> | **Total overhead** | **1.7-2x** | **1.34x** |
+>
+> The diarisation pass is **more than an order of magnitude cheaper** than estimated. The
+> reason is visible in hindsight: embedding runs once per ~1.5 s sub-segment of *speech*, not
+> continuously over the audio, so a 212 s file needs on the order of a hundred small forward
+> passes through a 28 MB model. I had reasoned about it as though it were a second
+> transcription-shaped workload. It is not.
+>
+> Two caveats on those numbers. Whisper's RTF on this fixture (0.039) is far below the 0.27
+> measured on dense real speech, because synthetic speech is easy and the fixture has silence
+> between turns; the *ratio* is the transferable figure, and on dense speech it would be lower
+> still, since Whisper's cost grows and diarisation's does not grow as fast. And this is one
+> fixture, not a corpus.
+>
+> **What that does to the argument.** The original case for opt-in was that diarisation
+> "roughly doubles the fleet". At 1.34x it does not. Opt-in survives on weaker but still real
+> grounds: it is a third more compute for something most jobs do not want, it changes the
+> output shape, and it forces word timings on. "Do not pay 34% for a field you ignore" is a
+> fair reason. "It would double your worker bill" was not true.
 
-| Stage | RTF (CPU, int8) | Basis |
-|---|---|---|
-| Whisper today | 0.27 | Measured, wall-to-wall speech |
-| + word timestamps, which alignment needs | ~0.30-0.34 | The measured 10-25% |
-| + segmentation | ~0.02-0.05 | Estimate. A small net over a sliding window. |
-| + embedding extraction | ~0.08-0.20 | Estimate. Dominates, and scales with speech, not file length. |
-| + global clustering | ~0 | Sub-second |
-| **Total** | **~0.45-0.55** | **Estimate** |
+One scheduling consequence, unchanged: the two latency classes split on audio duration. They
+should split on `duration x expected RTF` instead, or a diarised clip lands in the fast queue
+carrying more work than its duration suggests. `jobstore.latency_class_for` does this.
 
-So roughly **1.7-2× the compute of a plain transcript**. An audio-hour goes from about 16
-minutes of CPU to about 27-33. Against the capacity table above: 1,000 audio-hours/day needs
-~9 steady workers at RTF 0.2, and ~20-25 if every job is diarised.
-
-That is the case for per-job rather than always-on:
-
-- it roughly doubles the fleet for a feature a minority of jobs want;
-- the precedent already exists — `word_timestamps` is opt-in for exactly this reason, at a
-  fifth of the cost;
-- captioning is the overwhelmingly common downstream use, and it does not need speaker labels.
-
-One scheduling consequence. The two latency classes split on audio duration. They should split
-on `duration × expected RTF` instead, or a diarised three-minute clip lands in the fast queue
-and blows the latency it exists to protect.
-
-And the barrier. Global clustering cannot begin until the last window is embedded, so a diarised
-job has no partial speaker labels — progress still reports, but there is no useful intermediate
-result. Online diarisation exists and is materially less accurate. At this scale there is no
-good answer, so accept the barrier and say so in the docs.
+And the barrier, also unchanged. Global clustering cannot begin until the last window is
+embedded, so a diarised job has no partial speaker labels — progress still reports, but there is
+no useful intermediate result. Online diarisation exists and is materially less accurate. At
+this scale there is no good answer, so accept the barrier and say so in the docs.
 
 ### Overlapping speech and unknown speaker count
 
@@ -714,10 +730,11 @@ Were this to become the real service, in order:
 6. A labelled accuracy benchmark — WER per model size, and a diarisation error rate. Nothing
    below this line can be tuned honestly without one; the clustering threshold above is the
    clearest example.
-7. Speaker diarisation, as designed above: opt-in per job, the ungated backend by default, and
-   gated `pyannote` behind a build flag once the licence question is answered. It needs item 5
-   to retry cheaply and item 6 to be tuned at all, which is why it sits here rather than
-   earlier.
+7. ~~Speaker diarisation.~~ **Done** — opt-in per job, ungated ONNX backend, with a
+   ground-truth harness so the accuracy claim is checkable rather than asserted. Measured at
+   0.00% DER on two, three and five synthetic speakers, and 3.75% when turns run together with
+   no silence between them, which is the sub-segment grid showing through exactly where the
+   design predicted it would.
 8. The rest of the accuracy work: larger models on GPU, custom vocabulary.
 
 The ordering is deliberate. Everything above item 6 is about the service being trustworthy;

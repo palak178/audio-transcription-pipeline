@@ -15,6 +15,7 @@ import typer
 from transcription import audio as audio_module
 from transcription import exporters
 from transcription.config import get_settings
+from transcription.diarisation import SpeakerHint
 from transcription.errors import TranscriptionError
 from transcription.models import TranscriptionResult
 from transcription.pipeline import transcribe_file
@@ -58,6 +59,27 @@ def transcribe(
         bool,
         typer.Option("--word-timestamps", help="Also emit per-word timings (~10-25% slower)."),
     ] = False,
+    diarise: Annotated[
+        bool,
+        typer.Option(
+            "--diarise",
+            help=(
+                "Label who spoke each segment. Needs `transcribe diarise-warm` once, and "
+                "roughly doubles compute. Forces word timings on, since alignment is only as "
+                "good as the timestamps underneath it."
+            ),
+        ),
+    ] = False,
+    speakers: Annotated[
+        int | None,
+        typer.Option(
+            "--speakers",
+            help=(
+                "How many people are in the recording, if you know. The cheapest accuracy "
+                "available here: a known count replaces a threshold guess."
+            ),
+        ),
+    ] = None,
     max_duration: Annotated[
         float | None,
         typer.Option("--max-duration", help="Reject audio longer than this many seconds."),
@@ -98,6 +120,8 @@ def transcribe(
             settings=settings,
             language=language,
             word_timestamps=word_timestamps,
+            diarise=diarise or None,
+            speakers=SpeakerHint(exact=speakers) if speakers else None,
             progress=None if quiet else report,
             max_duration_seconds=max_duration,
         )
@@ -328,6 +352,43 @@ def apikey_revoke(
     else:
         typer.secho(f"no active key {parsed}", fg=typer.colors.YELLOW, err=True)
         raise typer.Exit(code=1)
+
+
+
+@app.command("diarise-warm")
+def diarise_warm(
+    force: Annotated[
+        bool, typer.Option("--force", help="Re-download even if the model is present.")
+    ] = False,
+) -> None:
+    """Download the speaker-embedding model, so the first diarised job is fast.
+
+    Deliberate rather than automatic, for the same reason `warm` exists: a service that
+    silently fetches 30 MB on its first request is a service that fails its first request on an
+    air-gapped host, which is exactly the deployment this project cares about.
+
+    The weights are ungated — a plain GitHub release download, no account and no token. Their
+    SHA-256 is pinned and checked, because a file fetched over the network then decides who the
+    service says was speaking.
+    """
+    from transcription.config import Settings
+    from transcription.diarisation_onnx import download_model, resolve_model_path
+
+    settings = Settings()
+    destination = resolve_model_path(settings)
+    typer.secho(f"speaker model -> {destination}", fg=typer.colors.CYAN, err=True)
+    try:
+        path = download_model(settings, force=force)
+    except Exception as exc:
+        typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    size_mb = path.stat().st_size / (1024 * 1024)
+    typer.secho(f"ready: {path} ({size_mb:.0f} MB)", fg=typer.colors.GREEN, err=True)
+    typer.secho(
+        "enable with TRANSCRIBE_DIARISATION_BACKEND=onnx, then `transcribe <file> --diarise`",
+        err=True,
+    )
 
 
 
