@@ -170,14 +170,24 @@ def load_diariser(settings: Settings) -> Diariser:
     backend = settings.diarisation_backend.strip().lower()
     if backend in {"", "none"}:
         raise DiarisationUnavailableError(
-            "No speaker diarisation backend is installed. The clustering and alignment are "
-            "implemented; the embedding model is not. See docs/DESIGN.md "
-            "(#how-would-you-add-speaker-diarisation) for the design and why the accurate "
-            "backend is gated.",
+            "Speaker diarisation is not enabled. Set TRANSCRIBE_DIARISATION_BACKEND=onnx and "
+            "fetch the model with `transcribe diarise-warm`. The clustering and alignment are "
+            "always available; only the embedding model is optional.",
             backend=backend or "none",
         )
+    if backend in {"onnx", "campplus", "sherpa", "sherpa-onnx"}:
+        from transcription.diarisation_onnx import OnnxDiariser
+
+        return OnnxDiariser(settings)
+    if backend in {"pyannote", "pyannote-3.1"}:
+        raise DiarisationUnavailableError(
+            "The pyannote backend is not implemented. Its weights are gated behind a Hugging "
+            "Face licence acceptance, which would make a token a build requirement for anyone "
+            "using this project. Use `onnx`, which is ungated.",
+            backend=backend,
+        )
     raise DiarisationUnavailableError(
-        f"Unknown diarisation backend {settings.diarisation_backend!r}.",
+        f"Unknown diarisation backend {settings.diarisation_backend!r}. Known: none, onnx.",
         backend=settings.diarisation_backend,
     )
 
@@ -279,6 +289,7 @@ def diarise_wav(
         threshold=settings.diarisation_threshold,
         min_embedding_seconds=settings.diarisation_min_embedding_seconds,
         hint=hint,
+        merge_gap_seconds=settings.diarisation_merge_gap_seconds,
     )
 
     speakers = _roster(labelled)
@@ -329,6 +340,7 @@ def _label(
     threshold: float,
     min_embedding_seconds: float,
     hint: SpeakerHint,
+    merge_gap_seconds: float = 0.0,
 ) -> list[SpeakerTurn]:
     """Cluster embeddings globally and turn clusters into speaker labels."""
     if not turns:
@@ -366,7 +378,7 @@ def _label(
 
     _label_short_turns(turns, labels)
 
-    return [
+    labelled = [
         SpeakerTurn(
             start=round(turn.start, 3),
             end=round(turn.end, 3),
@@ -376,6 +388,41 @@ def _label(
         for index, turn in enumerate(turns)
         if index in labels
     ]
+    return _merge_adjacent(labelled, merge_gap_seconds)
+
+
+def _merge_adjacent(
+    turns: list[SpeakerTurn], merge_gap_seconds: float
+) -> list[SpeakerTurn]:
+    """Join consecutive turns by the same speaker, separated by at most ``merge_gap_seconds``.
+
+    Necessary because a backend may hand over many small pieces rather than whole turns: the
+    ONNX backend cuts speech into fixed-length sub-segments, since it has no neural
+    speaker-change detector to find real boundaries. Without merging, one continuous minute of
+    one person talking would be reported as forty turns, and ``Speaker.turn_count`` would mean
+    nothing.
+
+    The gap allows for the natural pauses inside a single turn. Too large a value would swallow
+    a genuine quick exchange, which is why it is a setting rather than a constant.
+    """
+    if not turns:
+        return []
+
+    merged = [turns[0]]
+    for turn in turns[1:]:
+        previous = merged[-1]
+        contiguous = turn.start - previous.end <= merge_gap_seconds
+        if turn.speaker == previous.speaker and contiguous:
+            merged[-1] = SpeakerTurn(
+                start=previous.start,
+                end=max(previous.end, turn.end),
+                speaker=previous.speaker,
+                # Overlap anywhere in the merged span still means overlap in the span.
+                overlap=previous.overlap or turn.overlap,
+            )
+        else:
+            merged.append(turn)
+    return merged
 
 
 def _label_short_turns(turns: list[RawTurn], labels: dict[int, str]) -> None:

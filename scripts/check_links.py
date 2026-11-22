@@ -9,7 +9,9 @@ links the moment it happened, and this script is what found them.
 Run with no arguments from the repository root. Exits non-zero on the first problem, so it
 works as a CI gate.
 """
-import pathlib, re, sys
+import pathlib
+import re
+import sys
 
 root = pathlib.Path(".")
 docs = sorted(list(root.glob("*.md")) + list(root.glob("docs/*.md")))

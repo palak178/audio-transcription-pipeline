@@ -282,7 +282,10 @@ def test_a_zero_embedding_does_not_poison_every_comparison() -> None:
 @ffmpeg_required
 def test_short_turns_are_labelled_from_their_neighbours(make_audio, tmp_path) -> None:
     """A turn too short to embed still gets a label, from the speech around it."""
-    settings = diarisation_settings(diarisation_window_seconds=30.0)
+    # Merging off, so this test is about short-turn labelling alone. Merging has its own test.
+    settings = diarisation_settings(
+        diarisation_window_seconds=30.0, diarisation_merge_gap_seconds=0.0
+    )
     source = make_audio("short-turns.wav", seconds=20.0)
     wav = audio_module.normalize(source, tmp_path / "n.wav", max_duration_seconds=60)
 
@@ -648,7 +651,74 @@ def test_load_diariser_refuses_rather_than_pretending() -> None:
 
     assert caught.value.code == "diarisation_unavailable"
     assert caught.value.retryable is False
-    assert "DESIGN.md" in caught.value.message
+    assert "diarise-warm" in caught.value.message
 
-    with pytest.raises(DiarisationUnavailableError):
+    # pyannote is refused for a specific reason, and the message has to say which.
+    with pytest.raises(DiarisationUnavailableError, match="gated"):
         load_diariser(Settings(diarisation_backend="pyannote-3.1"))
+
+    with pytest.raises(DiarisationUnavailableError, match="Unknown"):
+        load_diariser(Settings(diarisation_backend="nonsense"))
+
+
+def test_adjacent_turns_by_one_speaker_are_merged() -> None:
+    """Without this, a backend that sub-segments reports one monologue as forty turns.
+
+    The ONNX backend cuts speech into fixed-length pieces because it has no neural
+    speaker-change detector, so merging is what turns those pieces back into turns and makes
+    `Speaker.turn_count` mean something.
+    """
+    from transcription.diarisation import _merge_adjacent
+
+    pieces = [
+        SpeakerTurn(start=0.0, end=1.5, speaker="SPEAKER_00"),
+        SpeakerTurn(start=1.5, end=3.0, speaker="SPEAKER_00"),
+        SpeakerTurn(start=3.1, end=4.6, speaker="SPEAKER_00"),
+        SpeakerTurn(start=4.6, end=6.0, speaker="SPEAKER_01"),
+        SpeakerTurn(start=6.0, end=7.5, speaker="SPEAKER_01"),
+        # A five-second gap: the same speaker, but a separate turn.
+        SpeakerTurn(start=12.5, end=14.0, speaker="SPEAKER_01"),
+    ]
+
+    merged = _merge_adjacent(pieces, 0.75)
+
+    assert [(t.start, t.end, t.speaker) for t in merged] == [
+        (0.0, 4.6, "SPEAKER_00"),
+        (4.6, 7.5, "SPEAKER_01"),
+        (12.5, 14.0, "SPEAKER_01"),
+    ]
+
+
+def test_merging_preserves_an_overlap_flag() -> None:
+    """Overlap anywhere inside a merged span still means overlap in that span."""
+    from transcription.diarisation import _merge_adjacent
+
+    merged = _merge_adjacent(
+        [
+            SpeakerTurn(start=0.0, end=1.5, speaker="SPEAKER_00"),
+            SpeakerTurn(start=1.5, end=3.0, speaker="SPEAKER_00", overlap=True),
+        ],
+        0.75,
+    )
+
+    assert len(merged) == 1
+    assert merged[0].overlap is True
+
+
+def test_merging_is_disabled_by_a_zero_gap() -> None:
+    """A backend that already returns whole turns should not have them altered."""
+    from transcription.diarisation import _merge_adjacent
+
+    pieces = [
+        SpeakerTurn(start=0.0, end=1.5, speaker="SPEAKER_00"),
+        SpeakerTurn(start=1.5, end=3.0, speaker="SPEAKER_00"),
+    ]
+
+    # Touching turns still merge at a zero gap, which is correct: there is no gap at all.
+    assert len(_merge_adjacent(pieces, 0.0)) == 1
+
+    spaced = [
+        SpeakerTurn(start=0.0, end=1.5, speaker="SPEAKER_00"),
+        SpeakerTurn(start=1.6, end=3.0, speaker="SPEAKER_00"),
+    ]
+    assert len(_merge_adjacent(spaced, 0.0)) == 2

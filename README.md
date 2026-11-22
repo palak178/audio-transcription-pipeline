@@ -10,7 +10,8 @@ Available as a CLI, a synchronous HTTP API, and an asynchronous job service with
 
 Formats are detected from content rather than filenames. Long recordings are transcribed in
 silence-aligned windows, so peak memory tracks the window rather than the length of the audio.
-Results come back as JSON, SRT, WebVTT or plain text. It runs **fully offline on CPU** with
+Speaker labels are optional. Results come back as JSON, SRT, WebVTT or plain text. It runs
+**fully offline on CPU** with
 [faster-whisper](https://github.com/SYSTRAN/faster-whisper) — no API key, no account, and the
 audio never leaves the host.
 
@@ -69,9 +70,9 @@ buy. Three more cases where building something proved a design wrong are recorde
 | Resume a long job after a crash | `checkpoint.py` | `test_jobs.py` |
 | Audio storage: filesystem or S3 | `blobstore.py` | `test_jobs.py` (S3 via `moto`) |
 | Per-tenant API keys | `auth.py` | `test_jobs.py` |
-| Speaker diarisation, minus the model | `diarisation.py` | `test_diarisation.py` |
+| Speaker diarisation | `diarisation.py`, `diarisation_onnx.py` | `test_diarisation.py`, `test_diarisation_onnx.py` |
 
-**206 fast tests** with no model download, 10 more against a real model, and CI that runs both
+**214 fast tests** with no model download, 15 more against real models, and CI that runs both
 plus a real Postgres and a `docker compose` stack end to end.
 
 ## Documentation
@@ -96,7 +97,7 @@ These are deliberately design rather than code, and DESIGN.md covers each one:
 | Per-tenant quotas and rate limits | Designed, not built. Authentication now exists to hang them off, which is the part that had to come first |
 | Presigned direct-to-storage upload | Designed. Content-hash idempotency and the storage abstraction are built; presigning only means anything for the S3 backend |
 | Alerting on DLQ depth and RTF regression | The metrics are exposed at `GET /v1/queue`; wiring them to a pager is deployment, not code |
-| Speaker diarisation — **the model backend only** | Everything around the model is built and tested: the overlapping window grid, the global clustering that makes labels mean the same thing across windows, boundary de-duplication, alignment onto segments, the schema and all four exporters (`diarisation.py`). The segmentation and embedding model is not, because `pyannote`'s weights are gated behind a Hugging Face licence and requiring one would break the offline, token-free setup above. Asking for diarisation returns `diarisation.status: failed` with `diarisation_unavailable` — a clear omission rather than a shaky implementation. [DESIGN.md](docs/DESIGN.md#how-would-you-add-speaker-diarisation) has the full design and the part-by-part state |
+| Overlapping-speech detection | The shipped diarisation backend has no overlap detector, so `speakers_overlap` is always `false`. `pyannote` does detect it and is gated behind a Hugging Face licence, which would make a token a build requirement for everyone. Flagged in the code rather than discovered |
 | Parallel transcription of windows | Windows contend for the same cores, and CTranslate2 already parallelises a single request across them. Parallelism belongs *across* files, in the worker pool |
 | Streaming / live transcription | A genuinely different problem (partial hypotheses, revision) and out of scope |
 
@@ -111,12 +112,12 @@ editing the design to match.
 ## If I had more time
 
 1. **A real accuracy benchmark** — WER against a labelled set such as LibriSpeech, per model
-   size, so the default model is an evidence-based choice rather than a reasoned one. This is
-   first because the next item depends on it.
-2. **A speaker diarisation backend.** Everything around the model is built and tested in
-   `diarisation.py`; what is missing is the segmentation and embedding model. It sits behind
-   item 1 deliberately — its one load-bearing tunable, the clustering threshold, cannot be
-   chosen honestly without labelled audio.
+   size, so the default model is an evidence-based choice rather than a reasoned one.
+2. **Diarisation measured on real conversational audio.** The harness exists and scores DER
+   against RTTM ground truth; what it has been pointed at so far is synthetic speech, which is
+   an easy case. VoxConverse or AMI would turn "the pipeline is correct" into "here is the
+   error rate on real audio", and would let the clustering threshold be tuned rather than
+   guessed.
 3. **Webhooks, then per-tenant quotas and rate limits.** Authentication exists to hang them
    off, which was the part that had to come first.
 4. **GPU path** — `float16` on CUDA is roughly an order of magnitude faster and changes the

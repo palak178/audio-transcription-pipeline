@@ -62,6 +62,21 @@ db-setup:  ## Create the local development and test databases
 	-createdb transcription
 	-createdb transcription_test
 
+diarise-warm:  ## Download the speaker-embedding model (28 MB, ungated)
+	$(PY) -m transcription.cli diarise-warm
+
+speaker-fixtures:  ## Build multi-speaker audio with exact ground truth (needs macOS `say`)
+	$(PY) scripts/make_speaker_fixture.py out/two_speakers --speakers 2 --turns 6 --gap 0.5
+	$(PY) scripts/make_speaker_fixture.py out/three --speakers 3 --turns 9
+	$(PY) scripts/make_speaker_fixture.py out/nogap --speakers 2 --turns 6 --gap 0.0
+
+diarise-eval: speaker-fixtures  ## Score diarisation against ground truth
+	@for f in two_speakers three nogap; do \
+		echo "=== $$f ==="; \
+		TRANSCRIBE_DIARISATION_BACKEND=onnx $(PY) scripts/evaluate_diarisation.py \
+			out/$$f.wav out/$$f.rttm || exit 1; \
+	done
+
 docker-build:  ## Build the container (bundles ffmpeg and the model)
 	docker build --build-arg MODEL=$(MODEL) -t audio-transcription-service .
 

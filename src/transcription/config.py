@@ -59,7 +59,28 @@ class Settings(BaseSettings):
     # are gated on Hugging Face, which would break the offline, token-free, three-command
     # setup this project guarantees. The clustering, de-duplication and alignment around the
     # backend are implemented and tested; the embedding model is the missing piece.
+    # `none` or `onnx`. The `onnx` backend uses an ungated CAM++ speaker-embedding model from
+    # the sherpa-onnx releases, fetched by `transcribe diarise-warm`. pyannote would be more
+    # accurate and is not an option here: its weights are gated behind a Hugging Face licence,
+    # so requiring them would break the offline, token-free setup for everyone else.
     diarisation_backend: str = "none"
+    # Where the speaker-embedding model lives. Defaults beside the Whisper weights.
+    diarisation_model_path: str | None = None
+    diarisation_threads: int = Field(default=2, ge=1)
+    # Speech is cut into pieces of about this length before embedding. This is the backend's
+    # boundary resolution, and its main weakness: there is no neural speaker-change detector
+    # here, so a turn boundary lands on this grid rather than where the speaker actually
+    # changed. Shorter is sharper but gives noisier embeddings.
+    diarisation_subsegment_seconds: float = Field(default=1.5, gt=0)
+    # Voice-activity thresholds for the diarisation pass, kept separate from transcription's
+    # because the two want different things: transcription wants to skip silence, diarisation
+    # wants speech boundaries tight enough to attribute.
+    diarisation_min_speech_ms: int = Field(default=250, ge=0)
+    diarisation_min_silence_ms: int = Field(default=250, ge=0)
+    # After clustering, adjacent turns by the same speaker separated by less than this are
+    # merged back into one. Sub-segmentation produces many small pieces; without this the
+    # speaker roster would report dozens of "turns" for one continuous stretch of talking.
+    diarisation_merge_gap_seconds: float = Field(default=0.75, ge=0)
     # Diarisation reads the audio on its own fixed, overlapping grid rather than reusing the
     # silence-aligned transcription windows. See audio.iter_wav_grid for why.
     diarisation_window_seconds: float = Field(default=120.0, gt=0)
