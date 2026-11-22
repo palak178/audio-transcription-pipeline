@@ -71,6 +71,11 @@ packages = ["src/transcription"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# The test modules import shared fakes with `from tests.conftest import ...`, which needs the
+# repository root on `sys.path`. `python -m pytest` puts it there and a bare `pytest` does not,
+# so the Makefile and CI stayed green while a fresh clone running plain `pytest` hit five
+# collection errors. Setting it here makes both invocations behave identically.
+pythonpath = ["."]
 # The default run excludes `slow`, so `pytest` needs no model weights and finishes in
 # about a second. `make test-all` includes them.
 addopts = "-q --strict-markers -m 'not slow'"
