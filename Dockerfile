@@ -36,6 +36,16 @@ RUN python -c "from faster_whisper import WhisperModel; WhisperModel('${MODEL}',
 
 # Run unprivileged.
 RUN useradd --create-home --uid 10001 appuser
+
+# Create the blob directory *and* hand it to appuser before dropping privileges. Docker
+# initialises an empty named volume from whatever the image has at the mount point, ownership
+# included — so creating it here is what makes a `docker compose` volume writable by an
+# unprivileged process. Without it the API starts fine, passes its health check, and then
+# fails every upload with EACCES, which is a confusing way to find out.
+RUN mkdir -p /var/lib/transcription/blobs \
+    && chown -R appuser:appuser /var/lib/transcription
+ENV TRANSCRIBE_BLOB_ROOT=/var/lib/transcription/blobs
+
 USER appuser
 
 EXPOSE 8000
