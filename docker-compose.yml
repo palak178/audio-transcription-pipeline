@@ -62,6 +62,24 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    # Without this, `docker compose up --wait` treats the container as ready the moment the
+    # process starts, which is well before uvicorn is listening — the API loads model weights
+    # first. A caller then gets a connection refused on an apparently-ready stack.
+    #
+    # Uses python rather than curl because the image is python:3.12-slim and does not ship one.
+    # /healthz is gated on the model being loaded, so passing it means genuinely ready.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import urllib.request,sys;
+          sys.exit(0 if urllib.request.urlopen('http://localhost:8000/healthz',
+          timeout=3).status == 200 else 1)"
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      # Model load plus migrations. Failures before this do not count against `retries`.
+      start_period: 40s
 
   worker:
     build:

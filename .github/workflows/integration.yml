@@ -85,8 +85,20 @@ jobs:
         run: |
           set -euo pipefail
 
-          id=$(curl -sf -F file=@samples/speech_en.mp3 http://localhost:8000/v1/jobs \
-               | python -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+          # Not `curl -sf | python`: -f discards the response body, so a failed submission
+          # becomes an unexplained JSON parse error rather than the status and message the
+          # server actually sent.
+          code=$(curl -s -o /tmp/submit.json -w '%{http_code}' \
+                 -F file=@samples/speech_en.mp3 http://localhost:8000/v1/jobs)
+          echo "submit returned HTTP $code"
+          cat /tmp/submit.json
+
+          if [ "$code" != "201" ] && [ "$code" != "200" ]; then
+            echo "::error::submission failed with HTTP $code"
+            exit 1
+          fi
+
+          id=$(python -c 'import json; print(json.load(open("/tmp/submit.json"))["id"])')
           echo "submitted job $id"
 
           for attempt in $(seq 1 60); do
