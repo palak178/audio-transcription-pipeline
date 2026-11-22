@@ -982,3 +982,28 @@ def test_last_used_is_recorded_but_not_on_every_request(job_settings, tenant) ->
             "SELECT last_used_at FROM api_keys WHERE id = %s", (record.id,)
         ).fetchone()[0]
     assert second == first, "a second call within the refresh window should not rewrite it"
+
+
+def test_migrations_are_discoverable_without_the_repository(job_settings) -> None:
+    """A regression test for a real outage, not a hypothetical.
+
+    The container shipped with no migrations at all: the Dockerfile copies `src/` and
+    migrations lived only at the repository root, so the service exited on startup the moment
+    the job tier was enabled. They are now force-included into the wheel as well, and the
+    resolver prefers the packaged copy.
+
+    This asserts the resolver finds a usable directory and that every file in it applies, which
+    is what "self-sufficient" has to mean.
+    """
+    from transcription import db as db_module
+
+    resolved = db_module._default_migrations_dir()
+    assert resolved.is_dir(), f"no migrations directory resolved (got {resolved})"
+
+    found = sorted(path.name for path in resolved.glob("*.sql"))
+    assert found, "the resolved directory contains no migrations"
+    assert found[0].startswith("001"), f"migrations should be numbered from 001, got {found}"
+
+    # Idempotent: a second pass applies nothing, which is what makes migrating on every
+    # process start safe.
+    assert db_module.migrate(job_settings) == []

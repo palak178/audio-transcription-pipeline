@@ -23,6 +23,10 @@ WORKDIR /app
 # which are far more expensive and both of which are unaffected by source edits.
 COPY pyproject.toml README.md ./
 COPY src ./src
+# Needed before the install: the wheel force-includes these into the package, so an installed
+# copy can migrate its own database. Without them the service exits at startup when the job
+# tier is enabled.
+COPY migrations ./migrations
 RUN pip install --no-cache-dir .
 
 # Pre-download the weights at build time. Without this, the first container run would stall

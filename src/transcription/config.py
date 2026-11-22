@@ -111,6 +111,9 @@ class Settings(BaseSettings):
     # the queue position move in a single transaction; see migrations/001_jobs.sql for why
     # that is worth more here than a dedicated broker.
     database_url: str = "postgresql:///transcription"
+    # Normally discovered: the packaged copy inside the installed distribution, or the
+    # repository root when running from a checkout. Override only for an unusual layout.
+    migrations_dir: str | None = None
     database_pool_min: int = Field(default=1, ge=1)
     database_pool_max: int = Field(default=8, ge=1)
     # How long a claimed job stays leased without a heartbeat. A worker that dies stops

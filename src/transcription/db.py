@@ -36,9 +36,24 @@ from transcription.errors import TranscriptionError
 
 logger = logging.getLogger(__name__)
 
-# migrations/ sits at the repository root rather than inside the package: it is operational
-# data, not importable code, and it should be readable without unpacking a wheel.
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
+def _default_migrations_dir() -> Path:
+    """Where the migrations are, whether running from a checkout or an installed wheel.
+
+    Both locations are real. The repository root is where the convention puts them and where
+    they can be read without unpacking anything; the packaged copy is what lets an installed
+    distribution migrate its own database. Checking the package first means a wheel is
+    self-sufficient, and falling back to the root means a checkout works before any build.
+
+    Getting this wrong is not theoretical: the container shipped with no migrations at all,
+    because the Dockerfile copies `src/` and nothing else, and the service exited on startup.
+    """
+    packaged = Path(__file__).resolve().parent / "migrations"
+    if packaged.is_dir():
+        return packaged
+    return Path(__file__).resolve().parents[2] / "migrations"
+
+
+MIGRATIONS_DIR = _default_migrations_dir()
 
 
 class DatabaseError(TranscriptionError):
@@ -121,7 +136,9 @@ def migrate(settings: Settings, *, migrations_dir: Path | None = None) -> list[s
     separate migration step to be correct. Each file runs inside its own transaction, so a
     failure leaves the database at the last complete migration rather than halfway through one.
     """
-    directory = migrations_dir or MIGRATIONS_DIR
+    # Explicit argument, then configuration, then the discovered default.
+    configured = getattr(settings, "migrations_dir", None)
+    directory = migrations_dir or (Path(configured) if configured else _default_migrations_dir())
     if not directory.is_dir():
         raise DatabaseError(f"No migrations directory at {directory}")
 
