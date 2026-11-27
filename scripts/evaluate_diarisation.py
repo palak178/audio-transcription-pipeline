@@ -4,64 +4,72 @@
 DER is the standard metric, and it is the sum of three different mistakes over the total
 reference speech:
 
-* **missed speech** — reference says someone spoke, the system says nobody did;
-* **false alarm** — the system says someone spoke where the reference has silence;
-* **confusion** — both agree someone spoke, and they disagree about who.
+* **missed speech** — the reference has more speakers active than the system found;
+* **false alarm** — the system found more speakers active than the reference has;
+* **confusion** — both agree on how many, and disagree about who.
 
-Confusion is the interesting one, and scoring it needs care: speaker labels are arbitrary.
-`SPEAKER_00` and `Daniel` are the same person if that is the mapping that fits best, so the
-score is taken over the **optimal** assignment of hypothesis labels to reference labels. This
-implementation tries every permutation, which is exact and fine up to about seven speakers; a
-real scorer uses the Hungarian algorithm to avoid the factorial. The limit is checked rather
-than assumed.
+Two things in here are easy to get wrong, and both were wrong in the first version.
 
-A **collar** is applied by convention — boundaries within the collar of a reference boundary
-are not scored, because human annotators do not agree to within a few hundred milliseconds
-either. The standard is 250 ms. Report the collar with any number, since DER without one is a
-different and much harsher metric.
+**Frames hold a set of speakers, not one.** Real annotations overlap: 230 of 300 VoxConverse
+files contain simultaneous speech. Assigning one speaker per frame lets the last turn silently
+win, which understates missed speech and misattributes the rest — a real corpus would have been
+scored wrongly and quietly.
+
+**The label mapping is solved, not searched.** Labels are arbitrary, so `SPEAKER_00` and
+`Daniel` are the same person if that is the mapping that fits best; choosing it is part of the
+metric. The first version tried every permutation, which caps out around seven speakers — and
+61 of 300 VoxConverse files have more than that, one reaching twenty. This uses the Hungarian
+algorithm, implemented here because `scipy` is not a dependency of this project.
+
+A **collar** is applied by convention: frames within the collar of a reference boundary are not
+scored, because human annotators do not agree to within a few hundred milliseconds either. The
+standard is 250 ms. Always report the collar with a DER, since the number means something
+different without one.
+
+**This is not a benchmark tool.** It is a dependency-free check that runs in CI against
+synthetic fixtures. For a published, comparable number on a real corpus, use `dscore` (the
+NIST-derived reference implementation) or `pyannote.metrics`.
 
 Usage::
 
-    python scripts/evaluate_diarisation.py out/two_speakers.wav out/two_speakers.rttm
+    python scripts/evaluate_diarisation.py out/two.wav out/two.rttm
 """
 
 from __future__ import annotations
 
 import argparse
-import itertools
+import math
 import sys
 from pathlib import Path
 
-RESOLUTION = 0.01  # 10 ms scoring grid, which is finer than any boundary we can defend.
+RESOLUTION = 0.01  # 10 ms scoring grid, finer than any boundary this system can defend.
 
 
 def read_rttm(path: Path) -> list[tuple[float, float, str]]:
+    """Parse the turns out of an RTTM file. Overlapping turns are kept as they are."""
     turns = []
     for line in path.read_text().splitlines():
         fields = line.split()
-        if not fields or fields[0] != "SPEAKER":
-            continue
-        start, duration, speaker = float(fields[3]), float(fields[4]), fields[7]
-        turns.append((start, start + duration, speaker))
+        if len(fields) > 7 and fields[0] == "SPEAKER":
+            start, duration, speaker = float(fields[3]), float(fields[4]), fields[7]
+            if duration > 0:
+                turns.append((start, start + duration, speaker))
     return sorted(turns)
 
 
-def to_frames(turns, total_frames):
-    """Who is speaking in each 10 ms frame. None where nobody is.
-
-    A frame grid rather than interval arithmetic because it makes the three error types fall
-    out as simple counts, and because overlap — which this project flags but does not resolve —
-    would otherwise need interval splitting to score at all.
-    """
-    frames = [None] * total_frames
+def to_frames(turns, total_frames: int) -> list[set[str]]:
+    """The set of speakers active in each 10 ms frame."""
+    frames: list[set[str]] = [set() for _ in range(total_frames)]
     for start, end, speaker in turns:
-        for index in range(int(start / RESOLUTION), min(int(end / RESOLUTION), total_frames)):
-            frames[index] = speaker
+        first = max(0, int(start / RESOLUTION))
+        last = min(int(end / RESOLUTION), total_frames)
+        for index in range(first, last):
+            frames[index].add(speaker)
     return frames
 
 
-def collar_mask(turns, total_frames, collar):
-    """Frames to exclude: within ``collar`` of any reference boundary."""
+def collar_mask(turns, total_frames: int, collar: float) -> list[bool]:
+    """Frames to exclude from scoring: those within ``collar`` of a reference boundary."""
     mask = [False] * total_frames
     if collar <= 0:
         return mask
@@ -74,63 +82,156 @@ def collar_mask(turns, total_frames, collar):
     return mask
 
 
-def score(reference, hypothesis, duration, collar=0.25):
-    total_frames = int(duration / RESOLUTION) + 1
-    ref = to_frames(reference, total_frames)
-    hyp = to_frames(hypothesis, total_frames)
-    skip = collar_mask(reference, total_frames, collar)
+def hungarian(cost: list[list[float]]) -> list[tuple[int, int | None]]:
+    """Minimum-cost assignment over a rectangular matrix. Returns ``(row, column)`` pairs.
 
-    ref_speakers = sorted({s for s in ref if s})
-    hyp_speakers = sorted({s for s in hyp if s})
-    if len(hyp_speakers) > 7:
-        sys.exit(
-            f"error: {len(hyp_speakers)} hypothesis speakers is too many for exhaustive "
-            "mapping; use a scorer with the Hungarian algorithm"
+    The O(n^3) shortest-augmenting-path formulation. Rows may outnumber columns or the reverse;
+    the matrix is padded square with zero-cost dummies, and a row matched only to a dummy comes
+    back paired with ``None``.
+    """
+    rows = len(cost)
+    columns = len(cost[0]) if rows else 0
+    if rows == 0 or columns == 0:
+        return [(row, None) for row in range(rows)]
+
+    size = max(rows, columns)
+    padded = [
+        [cost[r][c] if r < rows and c < columns else 0.0 for c in range(size)]
+        for r in range(size)
+    ]
+
+    # One-based internally, with index 0 used as the sentinel the algorithm needs.
+    u = [0.0] * (size + 1)
+    v = [0.0] * (size + 1)
+    match = [0] * (size + 1)  # match[column] -> row
+    parent = [0] * (size + 1)  # parent[column] -> previous column on the augmenting path
+
+    for row in range(1, size + 1):
+        match[0] = row
+        column = 0
+        minimum = [math.inf] * (size + 1)
+        used = [False] * (size + 1)
+
+        while True:
+            used[column] = True
+            current = match[column]
+            delta = math.inf
+            next_column = 0
+
+            for candidate in range(1, size + 1):
+                if used[candidate]:
+                    continue
+                reduced = padded[current - 1][candidate - 1] - u[current] - v[candidate]
+                if reduced < minimum[candidate]:
+                    minimum[candidate] = reduced
+                    parent[candidate] = column
+                if minimum[candidate] < delta:
+                    delta = minimum[candidate]
+                    next_column = candidate
+
+            for candidate in range(size + 1):
+                if used[candidate]:
+                    u[match[candidate]] += delta
+                    v[candidate] -= delta
+                else:
+                    minimum[candidate] -= delta
+
+            column = next_column
+            if match[column] == 0:
+                break
+
+        while column:
+            previous = parent[column]
+            match[column] = match[previous]
+            column = previous
+
+    assigned: dict[int, int] = {}
+    for column in range(1, size + 1):
+        if match[column]:
+            assigned[match[column] - 1] = column - 1
+
+    result = []
+    for row in range(rows):
+        column_index = assigned.get(row)
+        matched = (
+            column_index if column_index is not None and column_index < columns else None
         )
+        result.append((row, matched))
+    return result
 
-    scored = [i for i in range(total_frames) if not skip[i]]
-    reference_speech = sum(1 for i in scored if ref[i])
+
+def optimal_mapping(ref_frames, hyp_frames, scored, ref_speakers, hyp_speakers) -> dict:
+    """Assign hypothesis labels to reference labels so that frame agreement is maximised."""
+    if not hyp_speakers or not ref_speakers:
+        return {}
+
+    hyp_index = {speaker: i for i, speaker in enumerate(hyp_speakers)}
+    ref_index = {speaker: i for i, speaker in enumerate(ref_speakers)}
+    agreement = [[0] * len(ref_speakers) for _ in hyp_speakers]
+
+    for frame in scored:
+        for hypothesis_speaker in hyp_frames[frame]:
+            for reference_speaker in ref_frames[frame]:
+                agreement[hyp_index[hypothesis_speaker]][ref_index[reference_speaker]] += 1
+
+    # Hungarian minimises, so maximise agreement by minimising its negation.
+    cost = [[float(-value) for value in row] for row in agreement]
+    return {
+        hyp_speakers[row]: ref_speakers[column]
+        for row, column in hungarian(cost)
+        # A pairing with no agreement at all is not a correspondence. Leaving the hypothesis
+        # speaker unmapped is more honest than inventing one, and it scores as confusion.
+        if column is not None and agreement[row][column] > 0
+    }
+
+
+def score(reference, hypothesis, duration: float, collar: float = 0.25) -> dict:
+    """Diarisation error rate and its three components, overlap included."""
+    total_frames = int(duration / RESOLUTION) + 1
+    ref_frames = to_frames(reference, total_frames)
+    hyp_frames = to_frames(hypothesis, total_frames)
+    skip = collar_mask(reference, total_frames, collar)
+    scored = [index for index in range(total_frames) if not skip[index]]
+
+    ref_speakers = sorted({s for frame in ref_frames for s in frame})
+    hyp_speakers = sorted({s for frame in hyp_frames for s in frame})
+    mapping = optimal_mapping(ref_frames, hyp_frames, scored, ref_speakers, hyp_speakers)
+
+    missed = false_alarm = confusion = reference_speech = 0
+    overlap_frames = 0
+
+    for frame in scored:
+        reference_active = ref_frames[frame]
+        mapped = {mapping.get(s) for s in hyp_frames[frame]}
+        mapped.discard(None)
+
+        n_ref = len(reference_active)
+        n_hyp = len(hyp_frames[frame])
+        correct = len(reference_active & mapped)
+
+        reference_speech += n_ref
+        if n_ref > 1:
+            overlap_frames += 1
+        # The NIST decomposition: whichever side has more speakers accounts for the
+        # miss or false alarm, and the agreed-upon count that does not match is confusion.
+        missed += max(0, n_ref - n_hyp)
+        false_alarm += max(0, n_hyp - n_ref)
+        confusion += min(n_ref, n_hyp) - correct
+
     if reference_speech == 0:
         sys.exit("error: the reference contains no scored speech")
 
-    # Try every injective mapping of hypothesis labels onto reference labels, and keep the one
-    # that minimises confusion. Labels are arbitrary, so this is part of the metric, not a
-    # convenience.
-    best = None
-    # Candidates are the *reference* labels, padded with None so a hypothesis speaker who
-    # corresponds to nobody can be left unmapped. Permuting the hypothesis labels instead maps
-    # them onto themselves, which scores every frame as confusion — exactly 100%, which is how
-    # this bug announced itself.
-    candidates = list(ref_speakers) + [None] * max(0, len(hyp_speakers) - len(ref_speakers))
-    assignments = (
-        itertools.permutations(candidates, len(hyp_speakers)) if hyp_speakers else [()]
-    )
-    for assignment in assignments:
-        mapping = dict(zip(hyp_speakers, assignment, strict=False))
-        missed = false_alarm = confusion = 0
-        for i in scored:
-            r, h = ref[i], mapping.get(hyp[i]) if hyp[i] else None
-            if r and not h:
-                missed += 1
-            elif h and not r:
-                false_alarm += 1
-            elif r and h and r != h:
-                confusion += 1
-        total = missed + false_alarm + confusion
-        if best is None or total < best[0]:
-            best = (total, missed, false_alarm, confusion, mapping)
-
-    total, missed, false_alarm, confusion, mapping = best
     return {
-        "der": total / reference_speech,
+        "der": (missed + false_alarm + confusion) / reference_speech,
         "missed": missed / reference_speech,
         "false_alarm": false_alarm / reference_speech,
         "confusion": confusion / reference_speech,
         "collar_seconds": collar,
         "reference_speakers": len(ref_speakers),
         "hypothesis_speakers": len(hyp_speakers),
-        "mapping": {k: v for k, v in mapping.items() if v},
+        "mapping": mapping,
         "scored_speech_seconds": round(reference_speech * RESOLUTION, 2),
+        "overlap_seconds": round(overlap_frames * RESOLUTION, 2),
     }
 
 
@@ -141,6 +242,8 @@ def main() -> None:
     parser.add_argument("--collar", type=float, default=0.25)
     parser.add_argument("--model", default=None, help="Whisper model size.")
     args = parser.parse_args()
+
+    import tempfile
 
     from transcription import audio as audio_module
     from transcription.config import Settings
@@ -155,17 +258,13 @@ def main() -> None:
     reference = read_rttm(args.reference)
     duration = audio_module.probe_duration(args.audio)
 
-    import tempfile
-
     with tempfile.TemporaryDirectory(prefix="der-") as tmp:
         wav = audio_module.normalize(
             args.audio, Path(tmp) / "n.wav", max_duration_seconds=settings.max_duration_seconds
         )
         diariser = OnnxDiariser(settings)
         diariser.warm()
-        result = diarise_wav(
-            wav, diariser=diariser, settings=settings, audio_duration=duration
-        )
+        result = diarise_wav(wav, diariser=diariser, settings=settings, audio_duration=duration)
 
     hypothesis = [(t.start, t.end, t.speaker) for t in result.turns]
     report = score(reference, hypothesis, duration, collar=args.collar)
@@ -176,8 +275,10 @@ def main() -> None:
     print(f"speakers  reference  : {report['reference_speakers']}")
     print(f"speakers  found      : {report['hypothesis_speakers']}")
     print(f"mapping              : {report['mapping']}")
-    print(f"scored speech        : {report['scored_speech_seconds']}s "
-          f"(collar {report['collar_seconds']}s)")
+    print(
+        f"scored speech        : {report['scored_speech_seconds']}s "
+        f"(collar {report['collar_seconds']}s, {report['overlap_seconds']}s overlapped)"
+    )
     print()
     print(f"  missed speech      : {report['missed']:7.2%}")
     print(f"  false alarm        : {report['false_alarm']:7.2%}")
@@ -185,8 +286,16 @@ def main() -> None:
     print(f"  DER                : {report['der']:7.2%}")
 
     if report["hypothesis_speakers"] != report["reference_speakers"]:
-        print("\nnote: the speaker count is wrong, which usually means the clustering "
-              "threshold needs tuning for this audio.")
+        print(
+            "\nnote: the speaker count is wrong, which usually means the clustering threshold "
+            "needs tuning for this audio."
+        )
+    if report["overlap_seconds"] > 0:
+        print(
+            f"\nnote: {report['overlap_seconds']}s of the reference is overlapped speech. This "
+            "backend has no overlap detection, so those frames can only ever be scored as "
+            "missed speech."
+        )
 
 
 if __name__ == "__main__":

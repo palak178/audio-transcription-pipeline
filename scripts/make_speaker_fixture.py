@@ -41,6 +41,9 @@ from pathlib import Path
 # easy case on purpose. A harder fixture would use voices of one gender and accent.
 VOICES = ["Daniel", "Samantha", "Rishi", "Karen", "Moira"]
 
+# Per-clip gain applied before mixing, so two overlapping voices cannot sum past full scale.
+MIX_GAIN = 0.6
+
 # Deliberately varied in length. Equal-length turns would let a bug that quantises boundaries
 # to a fixed grid score well for the wrong reason.
 LINES = [
@@ -104,7 +107,16 @@ def silence(seconds: float, destination: Path) -> Path:
     return destination
 
 
-def build(output_stem: Path, *, speakers: int, turns: int, gap: float) -> dict:
+def build(
+    output_stem: Path, *, speakers: int, turns: int, gap: float, overlap_every: int = 0
+) -> dict:
+    """Render the turns, place them on a timeline, and mix.
+
+    Place-and-mix rather than concatenate, because concatenation cannot express overlap. Every
+    clip is delayed to its start time and all of them are summed, so a sequential fixture and
+    one with crosstalk are the same code path — the only difference is whether two clips'
+    spans intersect.
+    """
     if speakers > len(VOICES):
         sys.exit(f"error: only {len(VOICES)} voices are available")
 
@@ -112,47 +124,77 @@ def build(output_stem: Path, *, speakers: int, turns: int, gap: float) -> dict:
     work.mkdir(parents=True, exist_ok=True)
     output_stem.parent.mkdir(parents=True, exist_ok=True)
 
-    pieces: list[Path] = []
+    placed: list[tuple[Path, float]] = []  # (clip, start seconds)
     truth: list[dict] = []
     clock = 0.0
 
     for index in range(turns):
         voice = VOICES[index % speakers]
         line = LINES[index % len(LINES)]
-        piece = render(voice, line, work / f"turn_{index:03d}.wav")
-        duration = probe_duration(piece)
+        clip = render(voice, line, work / f"turn_{index:03d}.wav")
+        duration = probe_duration(clip)
 
+        placed.append((clip, clock))
         truth.append(
-            {
-                "speaker": voice,
-                "start": round(clock, 3),
-                "end": round(clock + duration, 3),
-                "text": line,
-            }
+            {"speaker": voice, "start": round(clock, 3), "end": round(clock + duration, 3),
+             "text": line, "overlapped": False}
         )
-        pieces.append(piece)
-        clock += duration
 
-        # Silence between turns, so VAD has a real boundary to find. Without it the turns run
-        # together and the fixture stops testing boundary detection at all.
+        # An interjection from the *next* speaker, starting partway through this turn, so the
+        # two genuinely overlap. This is what makes the fixture able to measure the backend's
+        # documented inability to detect simultaneous speech.
+        if overlap_every and index % overlap_every == 0 and speakers > 1:
+            interrupter = VOICES[(index + 1) % speakers]
+            start = clock + duration * 0.55
+            clip_b = render(interrupter, "Sorry, can I just jump in here for a second?",
+                            work / f"over_{index:03d}.wav")
+            duration_b = probe_duration(clip_b)
+            placed.append((clip_b, start))
+            truth.append(
+                {"speaker": interrupter, "start": round(start, 3),
+                 "end": round(start + duration_b, 3),
+                 "text": "Sorry, can I just jump in here for a second?", "overlapped": True}
+            )
+            # The turn is only over once the interjection is, or the next turn would land on
+            # top of it and create overlap the caller did not ask for.
+            clock = max(clock + duration, start + duration_b)
+        else:
+            clock += duration
+
         if gap > 0 and index < turns - 1:
-            pieces.append(silence(gap, work / f"gap_{index:03d}.wav"))
             clock += gap
 
-    concat_list = work / "concat.txt"
-    concat_list.write_text("".join(f"file '{p.resolve()}'\n" for p in pieces))
+    total = clock
+    # Delay each clip to its position, then sum. normalize=0 keeps levels as rendered rather
+    # than attenuating by the input count; two mixed TTS voices stay well short of clipping,
+    # and the level is checked after assembly.
+    inputs: list[str] = []
+    filters: list[str] = []
+    for position, (clip, start) in enumerate(placed):
+        inputs += ["-i", str(clip)]
+        delay = int(start * 1000)
+        # Attenuate before mixing. With normalize=0 the sum of two overlapping voices reached
+        # 0.0 dB — right on the clipping ceiling — and clipped audio would corrupt the speaker
+        # embeddings, making an overlap measurement fail for a reason that has nothing to do
+        # with diarisation. Headroom for two concurrent speakers costs nothing here.
+        filters.append(
+            f"[{position}:a]adelay={delay}|{delay},volume={MIX_GAIN}[d{position}]"
+        )
+    mix = "".join(f"[d{i}]" for i in range(len(placed)))
+    filters.append(f"{mix}amix=inputs={len(placed)}:normalize=0:duration=longest[out]")
+
     wav = output_stem.with_suffix(".wav")
     subprocess.run(
         [
             require("ffmpeg"), "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
-            "-f", "concat", "-safe", "0", "-i", str(concat_list),
-            "-c:a", "pcm_s16le", str(wav),
+            *inputs, "-filter_complex", ";".join(filters), "-map", "[out]",
+            "-t", f"{total:.3f}", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(wav),
         ],
         check=True,
     )
 
-    # RTTM, because that is what every diarisation scorer reads. One line per turn:
-    # SPEAKER <file> 1 <start> <duration> <NA> <NA> <speaker> <NA> <NA>
+    truth.sort(key=lambda item: (item["start"], item["end"]))
+
     rttm = output_stem.with_suffix(".rttm")
     rttm.write_text(
         "".join(
@@ -161,12 +203,14 @@ def build(output_stem: Path, *, speakers: int, turns: int, gap: float) -> dict:
             for t in truth
         )
     )
-    # JSON too, since it carries the text and is easier to read in a failure message.
+
+    overlapped = sum(1 for t in truth if t["overlapped"])
     meta = {
         "audio": wav.name,
         "duration_seconds": round(probe_duration(wav), 3),
         "speakers": sorted({t["speaker"] for t in truth}),
         "gap_seconds": gap,
+        "overlapping_turns": overlapped,
         "turns": truth,
         "note": (
             "Synthetic TTS voices, which are far more acoustically distinct than two real "
@@ -189,6 +233,16 @@ def main() -> None:
         "--gap", type=float, default=0.5, help="Silence between turns, in seconds."
     )
     parser.add_argument(
+        "--overlap-every",
+        type=int,
+        default=0,
+        help=(
+            "Add an interjection over every Nth turn, creating genuine simultaneous speech. "
+            "0 disables it. This is how the backend's documented lack of overlap detection "
+            "gets measured rather than merely asserted."
+        ),
+    )
+    parser.add_argument(
         "--voices",
         default=None,
         help=(
@@ -207,12 +261,16 @@ def main() -> None:
         VOICES = [v.strip() for v in args.voices.split(",") if v.strip()]
         args.speakers = min(args.speakers, len(VOICES))
 
-    meta = build(args.output, speakers=args.speakers, turns=args.turns, gap=args.gap)
+    meta = build(
+        args.output, speakers=args.speakers, turns=args.turns, gap=args.gap,
+        overlap_every=args.overlap_every,
+    )
     print(f"wrote {args.output.with_suffix('.wav')}")
     print(f"      {args.output.with_suffix('.rttm')}")
     print(f"      {args.output.with_suffix('.json')}")
     print(
-        f"{meta['duration_seconds']}s, {len(meta['turns'])} turns, "
+        f"{meta['duration_seconds']}s, {len(meta['turns'])} turns "
+        f"({meta['overlapping_turns']} overlapping), "
         f"{len(meta['speakers'])} speakers: {', '.join(meta['speakers'])}"
     )
 

@@ -69,9 +69,10 @@ speaker-fixtures:  ## Build multi-speaker audio with exact ground truth (needs m
 	$(PY) scripts/make_speaker_fixture.py out/two_speakers --speakers 2 --turns 6 --gap 0.5
 	$(PY) scripts/make_speaker_fixture.py out/three --speakers 3 --turns 9
 	$(PY) scripts/make_speaker_fixture.py out/nogap --speakers 2 --turns 6 --gap 0.0
+	$(PY) scripts/make_speaker_fixture.py out/crosstalk --speakers 2 --turns 4 --overlap-every 2
 
 diarise-eval: speaker-fixtures  ## Score diarisation against ground truth
-	@for f in two_speakers three nogap; do \
+	@for f in two_speakers three nogap crosstalk; do \
 		echo "=== $$f ==="; \
 		TRANSCRIBE_DIARISATION_BACKEND=onnx $(PY) scripts/evaluate_diarisation.py \
 			out/$$f.wav out/$$f.rttm || exit 1; \

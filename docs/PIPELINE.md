@@ -468,21 +468,42 @@ mapping of generated labels onto reference ones:
 | 5 speakers | 5 / 5 | 0.00% |
 | 2 speakers, same gender and different accents | 2 / 2 | 0.00% |
 | 2 speakers, **no silence between turns** | 2 / 2 | **3.75%** |
+| 2 speakers, **3 s of genuine crosstalk** | 2 / 2 | **15.78%** |
 
-The last row is the honest one, and it is the predicted weakness showing through. There is no
-neural speaker-change detector in this backend, so turn boundaries land on the sub-segment grid;
-when turns butt straight up against each other, the piece straddling the change gets one label
-and about 4% of frames are wrong. Put half a second of silence between speakers and it
+The last two rows are the honest ones, and both are predicted weaknesses showing through.
+
+**No silence between turns (3.75%).** There is no neural speaker-change detector here, so turn
+boundaries land on the sub-segment grid. When turns butt straight up against each other, the
+piece straddling the change gets one label. Put half a second of silence between speakers and it
 disappears.
+
+**Crosstalk (15.78%).** This is the more interesting number, because of what it decomposes
+into: **all of it is missed speech, and confusion is exactly zero.** The backend has no overlap
+detection, so in a frame where two people talk it names one of them — and the one it names is
+right. 15.78% of 19.07 s of reference speaker-time is 3.01 s, which is precisely the overlap in
+the fixture.
+
+So overlap costs its own duration and nothing else. That is a much tighter statement than
+"overlap is not handled", and it is the one pinned by
+`test_overlapped_speech_costs_exactly_its_own_duration` — which asserts the zero confusion more
+strictly than the DER, because a regression in general attribution would appear there first.
 
 **What these numbers are not.** Synthetic voices sit about 0.84 cosine distance apart, where
 two real people of one gender and accent sit far closer — so 0.00% here means the pipeline is
 correct, not that it is accurate on a real meeting. Reproduce, or point it at a real corpus:
 
 ```bash
-python scripts/make_speaker_fixture.py out/two --speakers 2 --turns 6 --gap 0.5
-python scripts/evaluate_diarisation.py out/two.wav out/two.rttm
+make diarise-eval                       # the fixtures above, scored
+# or build one by hand, including crosstalk:
+python scripts/make_speaker_fixture.py out/x --speakers 2 --turns 4 --overlap-every 2
+python scripts/evaluate_diarisation.py out/x.wav out/x.rttm
 ```
+
+**On the scorer itself.** `scripts/evaluate_diarisation.py` is deliberately dependency-free so
+it can run in CI, and it is *not* a benchmark tool. It scores overlap correctly and solves the
+label mapping with the Hungarian algorithm — both of which it got wrong first time, in ways
+that would have flattered the system — but for a published number on a real corpus, use
+`dscore` or `pyannote.metrics`, so the figure is comparable to other people's.
 
 ---
 

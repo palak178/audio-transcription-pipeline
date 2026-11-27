@@ -17,7 +17,9 @@
 > Four places where building it corrected the design, each marked in context below: the queue is
 > Postgres rather than SQS, idempotency needed more than `(tenant, audio, model)`, clustering's
 > real memory cost is the distance matrix rather than the embeddings, and diarisation's compute
-> cost was overestimated by more than an order of magnitude.
+> cost was overestimated by more than an order of magnitude. Where the design reasoned about a
+> limitation, there is now a number instead — overlap costs 15.78% DER on a crosstalk fixture,
+> all of it missed speech and none of it confusion.
 
 The single idea the rest of this document follows from:
 
@@ -488,6 +490,14 @@ this scale there is no good answer, so accept the barrier and say so in the docs
 
 **Overlap is detected and flagged, not resolved. Speaker count comes from a distance threshold,
 with an optional caller hint.**
+
+> **Measured.** A fixture with 3 s of genuine crosstalk scores 15.78% DER — and the
+> decomposition is the point: **all of it is missed speech, and confusion is exactly zero.** In
+> a frame where two people talk the backend names one of them, and the one it names is right.
+> So overlap costs its own duration and nothing else; it does not degrade attribution
+> elsewhere. That is a tighter and more useful claim than "not handled", and it is pinned by a
+> test rather than asserted here. Generating the fixture needs no corpus download: two TTS
+> voices mixed over the same span, with both in the ground truth.
 
 Overlap has no good answer here, and the reason is worth stating rather than designing around.
 `pyannote` can tell you two people are talking. Whisper cannot help: it transcribes a mixed

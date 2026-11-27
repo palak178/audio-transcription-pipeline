@@ -225,6 +225,56 @@ def test_the_pipeline_labels_a_real_transcript(two_speakers, tmp_path) -> None:
     assert min(s.speaker_confidence for s in result.segments) > 0.8
 
 
+@pytest.mark.slow
+@macos_required
+@backend_required
+def test_overlapped_speech_costs_exactly_its_own_duration(tmp_path) -> None:
+    """Quantifies the limitation this backend documents, instead of only asserting it.
+
+    A fixture with genuine crosstalk — two TTS voices mixed over the same span, with both in
+    the ground truth. The backend has no overlap detection, so every overlapped frame can only
+    ever be scored as missed speech.
+
+    The claim being pinned is the tight one: overlap costs its own duration **and nothing
+    else**. Confusion must stay at zero, because the speaker that *is* found in an overlapped
+    frame should still be one of the two who are really talking. A regression that degraded
+    attribution generally would show up here as confusion, which is why that assertion matters
+    more than the DER figure.
+    """
+    from scripts.evaluate_diarisation import read_rttm, score
+
+    out = tmp_path / "crosstalk"
+    subprocess.run(
+        [
+            sys.executable, str(SCRIPTS / "make_speaker_fixture.py"), str(out),
+            "--speakers", "2", "--turns", "4", "--gap", "0.4", "--overlap-every", "2",
+        ],
+        check=True, capture_output=True,
+    )
+    wav = out.with_suffix(".wav")
+    reference = read_rttm(out.with_suffix(".rttm"))
+
+    result = _diarise(wav, onnx_settings(), tmp_path)
+    hypothesis = [(turn.start, turn.end, turn.speaker) for turn in result.turns]
+    report = score(reference, hypothesis, audio_module.probe_duration(wav), collar=0.25)
+
+    assert report["overlap_seconds"] > 1.0, "the fixture should contain real crosstalk"
+    assert result.info.speaker_count == 2
+
+    # Every error is a miss, and the misses are the overlap.
+    assert report["confusion"] == 0.0, (
+        f"attribution degraded outside the overlap: {report}"
+    )
+    assert report["false_alarm"] < 0.02, report
+    expected_miss = report["overlap_seconds"] / report["scored_speech_seconds"]
+    assert report["missed"] == pytest.approx(expected_miss, abs=0.03), (
+        f"missed speech should equal the overlap duration: {report}"
+    )
+
+    # And the backend still refuses to claim it detected any of it.
+    assert result.info.overlap_seconds == 0.0
+
+
 # --- Unit level, no model needed ----------------------------------------------------------
 
 
@@ -281,3 +331,161 @@ def test_the_backend_name_identifies_the_weights() -> None:
     name = OnnxDiariser(onnx_settings(), model_path="/tmp/some_model.onnx").name
 
     assert "some_model" in name
+
+
+# --- The evaluator ------------------------------------------------------------------------
+#
+# Every accuracy claim in the documentation comes out of these functions, so they need to be
+# right. A scorer that flatters the system is worse than no scorer: it produces numbers that
+# look like evidence.
+
+
+def test_hungarian_matches_brute_force() -> None:
+    """The label mapping is part of the metric, so it has to be optimal, not merely plausible.
+
+    Checked against exhaustive search on small random matrices. The first version of this
+    scorer used exhaustive search in production and capped out at seven speakers — 61 of 300
+    VoxConverse files have more than that, one reaching twenty.
+    """
+    import itertools
+    import random
+
+    from scripts.evaluate_diarisation import hungarian
+
+    random.seed(20261123)
+    for _ in range(150):
+        rows = random.randint(1, 5)
+        columns = random.randint(rows, 6)  # square or wider, so every row gets matched
+        cost = [[float(random.randint(-20, 20)) for _ in range(columns)] for _ in range(rows)]
+
+        solved = sum(cost[r][c] for r, c in hungarian(cost) if c is not None)
+        exhaustive = min(
+            sum(cost[r][c] for r, c in enumerate(combo))
+            for combo in itertools.permutations(range(columns), rows)
+        )
+        assert solved == pytest.approx(exhaustive), cost
+
+
+def test_hungarian_never_reuses_a_column() -> None:
+    """More speakers than reference labels means some go unmapped, not double-mapped."""
+    from scripts.evaluate_diarisation import hungarian
+
+    cost = [[float(-(r + c)) for c in range(2)] for r in range(5)]
+    pairs = hungarian(cost)
+
+    used = [c for _, c in pairs if c is not None]
+    assert len(used) == len(set(used))
+    assert len(used) == 2
+    assert len(pairs) == 5
+
+
+def test_a_perfect_hypothesis_scores_zero() -> None:
+    from scripts.evaluate_diarisation import score
+
+    reference = [(0.0, 5.0, "A"), (6.0, 10.0, "B")]
+
+    report = score(reference, list(reference), 10.0, collar=0.0)
+
+    assert report["der"] == 0.0
+    assert report["reference_speakers"] == 2
+
+
+def test_labels_being_different_is_not_an_error() -> None:
+    """`SPEAKER_00` and `Daniel` are the same person if that is the mapping that fits."""
+    from scripts.evaluate_diarisation import score
+
+    reference = [(0.0, 5.0, "Daniel"), (6.0, 10.0, "Samantha")]
+    hypothesis = [(0.0, 5.0, "SPEAKER_01"), (6.0, 10.0, "SPEAKER_00")]
+
+    report = score(reference, hypothesis, 10.0, collar=0.0)
+
+    assert report["der"] == 0.0
+    assert report["mapping"] == {"SPEAKER_01": "Daniel", "SPEAKER_00": "Samantha"}
+
+
+def test_overlap_the_system_cannot_hear_is_counted_as_missed_speech() -> None:
+    """The limitation this backend documents, scored the way NIST scores it.
+
+    Two speakers talk over each other for two seconds; the hypothesis names only one. Those
+    frames have two reference speakers and one hypothesis speaker, so each contributes one
+    missed speaker-frame — and nothing else. Confusion stays zero because the speaker that
+    *was* found is the right one.
+
+    An earlier version of `to_frames` kept one speaker per frame and let the last turn win,
+    which hid this entirely.
+    """
+    from scripts.evaluate_diarisation import score
+
+    reference = [(0.0, 4.0, "A"), (2.0, 4.0, "B")]  # 2 s of genuine overlap
+    hypothesis = [(0.0, 4.0, "A")]
+
+    report = score(reference, hypothesis, 4.0, collar=0.0)
+
+    assert report["overlap_seconds"] == pytest.approx(2.0, abs=0.02)
+    # Reference speaker-time is 4 s of A plus 2 s of B; the 2 s of B is all missed.
+    assert report["scored_speech_seconds"] == pytest.approx(6.0, abs=0.02)
+    assert report["missed"] == pytest.approx(2.0 / 6.0, abs=0.01)
+    assert report["confusion"] == 0.0
+    assert report["false_alarm"] == 0.0
+
+
+def test_inventing_speech_is_a_false_alarm() -> None:
+    from scripts.evaluate_diarisation import score
+
+    reference = [(0.0, 2.0, "A")]
+    hypothesis = [(0.0, 4.0, "A")]  # two seconds of speech that is not there
+
+    report = score(reference, hypothesis, 4.0, collar=0.0)
+
+    assert report["false_alarm"] == pytest.approx(1.0, abs=0.02)  # 2 s FA over 2 s of speech
+    assert report["missed"] == 0.0
+
+
+def test_naming_the_wrong_speaker_is_confusion_not_a_miss() -> None:
+    """The three error types have to stay distinct, or the decomposition says nothing."""
+    from scripts.evaluate_diarisation import score
+
+    reference = [(0.0, 4.0, "A"), (4.0, 8.0, "B")]
+    # Right about where speech is, wrong about who, for the second half.
+    hypothesis = [(0.0, 4.0, "X"), (4.0, 8.0, "X")]
+
+    report = score(reference, hypothesis, 8.0, collar=0.0)
+
+    assert report["missed"] == 0.0
+    assert report["false_alarm"] == 0.0
+    assert report["confusion"] == pytest.approx(0.5, abs=0.02)
+    assert report["der"] == pytest.approx(0.5, abs=0.02)
+
+
+def test_the_collar_excludes_frames_near_a_boundary() -> None:
+    """Annotators do not agree to within a few hundred milliseconds, so neither should scoring."""
+    from scripts.evaluate_diarisation import score
+
+    reference = [(0.0, 5.0, "A")]
+    # Late by 200 ms, which is inside a 250 ms collar and outside a zero one.
+    hypothesis = [(0.2, 5.0, "A")]
+
+    assert score(reference, hypothesis, 5.0, collar=0.0)["der"] > 0.03
+    assert score(reference, hypothesis, 5.0, collar=0.25)["der"] == 0.0
+
+
+def test_rttm_round_trips() -> None:
+    import tempfile
+
+    from scripts.evaluate_diarisation import read_rttm
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "r.rttm"
+        path.write_text(
+            "SPEAKER f 1 0.000 4.705 <NA> <NA> Daniel <NA> <NA>\n"
+            "SPEAKER f 1 2.588 2.754 <NA> <NA> Samantha <NA> <NA>\n"
+            "# a comment line that is not a turn\n"
+            "SPEAKER f 1 9.000 0.000 <NA> <NA> Zero <NA> <NA>\n"  # zero duration, dropped
+        )
+        turns = read_rttm(path)
+
+    # End times are computed as start + duration, so compare with a tolerance rather than
+    # exactly: 2.588 + 2.754 is not precisely 5.342 in binary floating point.
+    assert [t[2] for t in turns] == ["Daniel", "Samantha"]
+    assert turns[0][0] == pytest.approx(0.0) and turns[0][1] == pytest.approx(4.705)
+    assert turns[1][0] == pytest.approx(2.588) and turns[1][1] == pytest.approx(5.342)
